@@ -25,35 +25,39 @@ use crate::{
     utils::{exceeds_majority, get_current_time, rand_election_timeout},
 };
 
+#[derive(Clone)]
 pub struct Node {
     pub(crate) state: Arc<Mutex<NodeState>>,
     pub(crate) leader_state: Arc<Mutex<Option<LeaderState>>>, // might not need if i use this state within leader's function, but what if leader goes down for just a bit, need to store this in that case, in case leader remains the leader.
 }
 
 impl Node {
-    pub fn new(id: usize, min_timeout: u64, peers: &Vec<RaftRpcClient>) -> Self {
+    pub fn new(id: usize, min_timeout: u64, peers: &[RaftRpcClient]) -> Self {
         let zero_log_metadata = LogMetadata { term: 0, index: 0 };
+        let mut leader_state = None;
+        let mut current_type = NodeType::Follower;
+
         let node_state = NodeState {
-            current_type: NodeType::Follower,
+            current_type,
             logs: vec![Log {
                 metadata: zero_log_metadata,
                 log: START.to_string(),
             }],
-            current_term: 0,
+            current_term: 0, // A hack. if this node is leader, then current_term = 1, else 0
             voted_for: None,
             commit_index: zero_log_metadata,
             latest_log: zero_log_metadata,
             leader: None,
             id: NodeId(id),
             min_timeout,
-            peers: peers.clone(),
+            peers: peers.to_vec(),
             last_applied: 0,
             last_leader_contact: get_current_time(),
         };
 
         Self {
             state: Arc::new(Mutex::new(node_state)),
-            leader_state: Arc::new(Mutex::new(None)),
+            leader_state: Arc::new(Mutex::new(leader_state)),
         }
     }
 
@@ -61,7 +65,16 @@ impl Node {
         let mut min_timeout;
         {
             let mut state = self.state.lock().unwrap();
+
             state.current_type = node_type.unwrap_or(NodeType::Follower);
+            if state.current_type == NodeType::Leader {
+                let mut mu = self.leader_state.lock().unwrap();
+                state.current_term = 1;
+                *mu = Some(LeaderState {
+                    match_index: vec![0; state.peers.len()],
+                    next_log_index: 1,
+                });
+            }
             min_timeout = state.min_timeout;
         }
 
@@ -238,63 +251,75 @@ impl Node {
     }
 
     pub async fn call_append_entries(&mut self, logs_str: Vec<String>) -> Result<()> {
-        let mut state = self.state.lock().unwrap();
+        let logs_1str = logs_str.clone();
+        let (peers, id, logs, commit_index, current_term, prev_log) = {
+            let mut state = self.state.lock().unwrap();
 
-        if state.current_type != NodeType::Leader {
-            return Err(anyhow!("call_append_entries called by non-leader"));
-        }
-        let mut leader_state = self.leader_state.lock().unwrap();
+            if state.current_type != NodeType::Leader {
+                return Err(anyhow!("call_append_entries called by non-leader"));
+            }
+            let mut leader_state = self.leader_state.lock().unwrap();
 
-        let mut logs = Vec::new();
-        let mut next_log_index = leader_state.as_ref().unwrap().next_log_index;
+            let mut logs = Vec::new();
+            let mut next_log_index = leader_state.as_ref().unwrap().next_log_index;
 
-        let mut log_metadata = state.latest_log;
-        for log_str in logs_str {
-            log_metadata = LogMetadata {
-                term: state.current_term,
-                index: next_log_index,
-            };
-            next_log_index += 1;
-            logs.push(Log {
-                log: log_str,
-                metadata: log_metadata,
-            });
-        }
-        leader_state.as_mut().unwrap().next_log_index = next_log_index;
+            let mut log_metadata = state.latest_log;
+            for log_str in logs_str {
+                log_metadata = LogMetadata {
+                    term: state.current_term,
+                    index: next_log_index,
+                };
+                next_log_index += 1;
+                logs.push(Log {
+                    log: log_str,
+                    metadata: log_metadata,
+                });
+            }
+            leader_state.as_mut().unwrap().next_log_index = next_log_index;
 
-        state.logs.append(&mut logs.clone());
+            let prev_log = state.latest_log;
+            state.logs.append(&mut logs.clone());
+            // println!("state's logs : {:?}", state.logs);
 
-        let peers = state.peers.clone();
-        let current_term = state.current_term;
-        let id = state.id;
-        let commit_index = state.commit_index;
-        let prev_log = state.latest_log;
-        state.latest_log = log_metadata;
-        state.last_leader_contact = get_current_time();
-        drop(leader_state);
-        drop(state);
-
+            state.latest_log = log_metadata;
+            state.last_leader_contact = get_current_time();
+            (
+                state.peers.clone(),
+                state.id,
+                logs,
+                state.commit_index,
+                state.current_term,
+                prev_log,
+            )
+        };
+        println!(
+            "call_append_entries called with prev_log: {prev_log:?}, new logs: {:?}",
+            &logs_1str
+        );
+        // NOTE: Locks DROPPED here
         let replica_count = Arc::new(AtomicU32::new(1));
         let notify = Arc::new(Notify::new());
         let mut tasks = Vec::new();
 
-        for i in 0..peers.len() {
+        for (i, peer) in peers.iter().enumerate() {
             // skip the leader ofcourse
             if i == id.0 {
                 continue;
             }
 
             let rc_cl = replica_count.clone();
-            let peer = peers[i].clone();
+            let peer_c = peer.clone();
             let state_c = self.state.clone();
             let leader_state_c = self.leader_state.clone();
+            // 06/14/2026 02:27 PM IST - TODO: can just pass Arc of logs
             let logs_cl = logs.clone();
 
+            // println!("node {i}, logs_cl: {logs_cl:?}, call_append_entries");
             let notify_cl = notify.clone();
             let task = tokio::spawn(async move {
-                appent_entry_task(
+                append_entry_task(
                     logs_cl,
-                    peer,
+                    peer_c,
                     rc_cl,
                     id,
                     commit_index,
@@ -317,7 +342,8 @@ impl Node {
     }
 }
 
-async fn appent_entry_task(
+// called by the leader, handles sending appendEntries RPC to follower
+async fn append_entry_task(
     logs: Vec<Log>,
     peer: RaftRpcClient,
     rc_cl: Arc<AtomicU32>,
@@ -330,12 +356,14 @@ async fn appent_entry_task(
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     notify: Arc<Notify>,
 ) {
+    // println!("append_entry_task called {peer_index}");
+    // WARNING: there are too many arguments in this function call. I did this initially just so that i don't have to lock and read state again. I need to rethink this strategy later.
     let latest_metadata = if logs.is_empty() {
         prev_log
     } else {
         logs.last().unwrap().metadata
     };
-    // WARNING: there are too many arguments in this function call. I did this initially just so that i don't have to lock and read state again. I need to rethink this strategy later.
+    println!("at append_entry_task, in the append_entries RPC call : prev_log_metadata: {prev_log:?}, latest_metadata: {latest_metadata:?}");
     let response = peer
         .append_entries(
             context::current(),
@@ -348,13 +376,16 @@ async fn appent_entry_task(
         .await
         .unwrap()
         .unwrap();
+    // println!("append_entry_task response by {id:?} for peer {peer_index}: {response:?}");
     // 05/24/2026 06:28 PM IST - TODO: might not want to unwrap here.
 
     if response.1 {
+        // println!("append_entries is successful, for peer {peer_index}");
         // append_entries is successful
         handle_successful_append(state, leader_state, rc_cl, latest_metadata, id.0, notify);
         return;
     }
+    // println!("after receiving {response:?}, retrying");
 
     // Handling for the scenarion wherin the response's term > current_term, which means that this node is no longer the leader.
     if response.0 > current_term {
@@ -402,9 +433,9 @@ async fn appent_entry_task(
             return;
         }
     }
-    todo!()
 }
 
+// called by leader
 fn handle_successful_append(
     state: Arc<Mutex<NodeState>>,
     leader_state: Arc<Mutex<Option<LeaderState>>>,
@@ -414,10 +445,11 @@ fn handle_successful_append(
     notify: Arc<Notify>,
 ) {
     let mut state_lock = state.lock().unwrap();
-    let count = replica_count.fetch_add(1 as u32, std::sync::atomic::Ordering::SeqCst) + 1;
+    let count = replica_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
     if count == ((state_lock.peers.len() + 1).div_ceil(2) as u32) {
         // signal that majority is achieved
+        println!("majority is achieved, at {i}, with new metadata: {metadata:?}");
         if metadata.gt(&state_lock.commit_index) {
             state_lock.commit_index = metadata;
         }

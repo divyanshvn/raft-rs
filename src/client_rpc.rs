@@ -1,10 +1,10 @@
 use std::{
+    any::Any,
     collections::VecDeque,
     sync::{atomic::AtomicU32, Arc, Mutex},
 };
 
 use anyhow::Result;
-use tarpc::context;
 
 use crate::{
     node::Node,
@@ -19,6 +19,11 @@ pub trait ClientRpc {
 
 impl ClientRpc for Node {
     async fn reply_log(mut self, context: tarpc::context::Context, log: String) -> Result<()> {
+        println!(
+            "append at node {:?}: {}",
+            self.state.lock().unwrap().id,
+            log
+        );
         self.call_append_entries(vec![log]).await?;
         Ok(())
     }
