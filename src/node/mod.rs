@@ -61,6 +61,11 @@ impl Node {
         }
     }
 
+    pub fn get_state(&self) -> (u32, bool) {
+        let state = self.state.lock().unwrap();
+        (state.current_term, state.current_type == NodeType::Leader)
+    }
+
     pub async fn start(mut self, node_type: Option<NodeType>) -> Result<()> {
         let mut min_timeout;
         {
@@ -85,10 +90,14 @@ impl Node {
                     {
                         let mut state = self.state.lock().unwrap();
                         state.last_leader_contact = get_current_time();
-                        self.leader_state = Arc::new(Mutex::new(Some(LeaderState {
+                        println!(
+                            "node {} is the leader now with term: {}",
+                            state.id.0, state.current_term
+                        );
+                        *(self.leader_state.lock().as_deref_mut().unwrap()) = Some(LeaderState {
                             match_index: vec![0; state.peers.len()],
                             next_log_index: state.latest_log.index + 1,
-                        })));
+                        });
                     }
                     // initialize (or even re-initialize in some state vars case) the state variables accordingly
                     self.call_append_entries(vec![]).await.unwrap();
@@ -98,7 +107,7 @@ impl Node {
                     let mut timeout = min_timeout;
                     loop {
                         let task = tokio::spawn(async move {
-                            sleep(Duration::from_secs(timeout)).await;
+                            sleep(Duration::from_millis(timeout)).await;
                         });
                         task.await.unwrap();
 
@@ -125,7 +134,7 @@ impl Node {
                     let mut timeout = rand_election_timeout(min_timeout);
                     loop {
                         let task = tokio::spawn(async move {
-                            sleep(Duration::from_secs(timeout)).await;
+                            sleep(Duration::from_millis(timeout)).await;
                         });
 
                         task.await.unwrap();
@@ -135,6 +144,11 @@ impl Node {
                         let time_since_leader_contact = current_time - state.last_leader_contact;
 
                         if time_since_leader_contact > timeout {
+                            // println!(
+                            //     "Node {} becoming candidate, term {}",
+                            //     state.id.0,
+                            //     state.current_term + 1
+                            // );
                             state.current_type = NodeType::Candidate;
                             state.current_term += 1;
                             state.voted_for = Some((state.id, state.current_term));
@@ -153,6 +167,10 @@ impl Node {
 
                     let (id, current_term, peers, latest_log, min_timeout) = {
                         let state = self.state.lock().unwrap();
+                        println!(
+                            "node {} is candidate for term: {}",
+                            state.id.0, state.current_term
+                        );
                         let current_term = state.current_term;
                         let peers = state.peers.clone();
 
@@ -176,30 +194,31 @@ impl Node {
                         let peer_cl = peers[i].clone();
 
                         tokio::spawn(async move {
-                            match peer_cl
+                            let resp = peer_cl
                                 .request_vote(context::current(), current_term, id, latest_log)
-                                .await
-                                .unwrap()
-                            {
-                                Ok((term, voted)) => {
-                                    if voted {
-                                        let num_votes =
-                                            num_votes_cl.fetch_add(1, Ordering::SeqCst) + 1;
-                                        if num_votes == ((num_peers + 1).div_ceil(2) as u32) {
-                                            notify_cl.notify_one();
-                                        }
-                                        return;
-                                    }
+                                .await;
 
-                                    // when voted is false and current_term is lagging behind
-                                    if term > current_term {
-                                        // change back to follower
-                                        // change num_votes to 0 , to signal this.
-                                        num_votes_cl.store(0, Ordering::SeqCst);
+                            if let Ok(Ok((term, voted))) = resp {
+                                if voted {
+                                    let num_votes = num_votes_cl.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if num_votes == ((num_peers + 1).div_ceil(2) as u32) {
+                                        // println!(
+                                        //     "Node {} won majority in term {}",
+                                        //     id.0, current_term
+                                        // );
                                         notify_cl.notify_one();
                                     }
+                                    return;
                                 }
-                                Err(_) => unimplemented!(), // No Error case right now in the request_vote implementation
+
+                                // when voted is false and current_term is lagging behind
+                                if term > current_term {
+                                    // change back to follower
+                                    // change num_votes to 0 , to signal this.
+                                    // 06/17/2026 12:26 PM IST - TODO: When should this be turned back to follower?
+                                    num_votes_cl.store(0, Ordering::SeqCst);
+                                    notify_cl.notify_one();
+                                }
                             }
                         });
                     }
@@ -210,7 +229,7 @@ impl Node {
                     // spawn an election timout
                     tokio::spawn(async move {
                         // 05/26/2026 02:24 PM IST - WARN: need to check whether this wakes up exactly after election_timeout secs.
-                        tokio::time::sleep(Duration::from_secs(election_timeout)).await;
+                        tokio::time::sleep(Duration::from_millis(election_timeout)).await;
                         notify_cl.notify_one();
                     });
 
@@ -226,6 +245,11 @@ impl Node {
 
                     if exceeds_majority(num_votes, num_peers) {
                         // convert to leader
+                        let (node_id, term) = {
+                            let state = self.state.lock().unwrap();
+                            (state.id.0, state.current_term)
+                        };
+                        // println!("Node {} becoming LEADER in term {}", node_id, term);
                         {
                             let mut state = self.state.lock().unwrap();
                             state.current_type = NodeType::Leader;
@@ -292,10 +316,10 @@ impl Node {
                 prev_log,
             )
         };
-        println!(
-            "call_append_entries called with prev_log: {prev_log:?}, new logs: {:?}",
-            &logs_1str
-        );
+        // println!(
+        //     "call_append_entries called with prev_log: {prev_log:?}, new logs: {:?}",
+        //     &logs_1str
+        // );
         // NOTE: Locks DROPPED here
         let replica_count = Arc::new(AtomicU32::new(1));
         let notify = Arc::new(Notify::new());
@@ -356,14 +380,12 @@ async fn append_entry_task(
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     notify: Arc<Notify>,
 ) {
-    // println!("append_entry_task called {peer_index}");
     // WARNING: there are too many arguments in this function call. I did this initially just so that i don't have to lock and read state again. I need to rethink this strategy later.
     let latest_metadata = if logs.is_empty() {
         prev_log
     } else {
         logs.last().unwrap().metadata
     };
-    println!("at append_entry_task, in the append_entries RPC call : prev_log_metadata: {prev_log:?}, latest_metadata: {latest_metadata:?}");
     let response = peer
         .append_entries(
             context::current(),
@@ -373,10 +395,12 @@ async fn append_entry_task(
             logs.clone(),
             commit_index,
         )
-        .await
-        .unwrap()
-        .unwrap();
-    // println!("append_entry_task response by {id:?} for peer {peer_index}: {response:?}");
+        .await;
+
+    let response = match response {
+        Ok(Ok(resp)) => resp,
+        _ => return,
+    };
     // 05/24/2026 06:28 PM IST - TODO: might not want to unwrap here.
 
     if response.1 {
@@ -417,9 +441,12 @@ async fn append_entry_task(
                 entries.clone().into(),
                 commit_index,
             )
-            .await
-            .unwrap()
-            .unwrap();
+            .await;
+
+        let response = match response {
+            Ok(Ok(resp)) => resp,
+            _ => return,
+        };
         if response.1 {
             // append_entries is successful
             handle_successful_append(
@@ -449,13 +476,14 @@ fn handle_successful_append(
 
     if count == ((state_lock.peers.len() + 1).div_ceil(2) as u32) {
         // signal that majority is achieved
-        println!("majority is achieved, at {i}, with new metadata: {metadata:?}");
+        // println!("majority is achieved, at {i}, with new metadata: {metadata:?}");
         if metadata.gt(&state_lock.commit_index) {
             state_lock.commit_index = metadata;
         }
         notify.notify_one();
     }
 
+    println!("node at handle_successful_append : {}", state_lock.id.0);
     drop(state_lock);
 
     let mut binding = leader_state.lock().unwrap();
