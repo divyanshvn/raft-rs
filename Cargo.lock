@@ -486,6 +486,7 @@ dependencies = [
  "serde_json",
  "tarpc",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

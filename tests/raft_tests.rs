@@ -27,6 +27,7 @@ async fn test_re_election() {
         cfg.disconnect(leader);
         let current_time = Instant::now();
 
+        println!("Getting new leader, term: {}", term);
         (leader, term) = cfg.check_one_leader(Some(term)).await;
         println!("leader: {}, term: {}", leader, term);
         cfg.clients[&leader]

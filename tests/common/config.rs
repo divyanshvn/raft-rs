@@ -1,7 +1,10 @@
 use futures::StreamExt;
 use raft_rs::client_rpc::{ClientRpc, ClientRpcClient};
 use raft_rs::types1::NodeType;
+use std::cmp::Ordering;
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::ops::Div;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tarpc::{client, server, server::Channel};
@@ -116,31 +119,55 @@ impl Config {
     }
 
     pub async fn check_one_leader(&self, current_term: Option<u32>) -> (usize, u32) {
-        sleep(Duration::from_millis(5000)).await;
+        sleep(Duration::from_secs(5)).await;
         for _iters in 0..10 {
             sleep(Duration::from_millis(500)).await;
 
-            let mut leaders = Vec::new();
+            // let mut leaders = Vec::new();
+            // leader-node-id to number of followers
+            let mut leader_map: HashMap<usize, u8> = HashMap::new();
 
             let nodes_map = self.nodes.clone();
             for i in 0..self.n {
-                if self.network.is_connected(i, i) {
-                    if let Some(node) = nodes_map.get(&i) {
-                        let (term, is_leader) = node.lock().unwrap().get_state();
-                        if is_leader && current_term.is_some() && term > current_term.unwrap() {
-                            leaders.push((i, term));
-                        }
+                if let Some(node) = nodes_map.get(&i) {
+                    let leader = node.lock().unwrap().get_leader();
+                    let Some(leader_node) = leader else {
+                        continue;
+                    };
+                    if let Entry::Vacant(e) = leader_map.entry(leader_node) {
+                        e.insert(1);
+                    } else {
+                        *leader_map.get_mut(&leader_node).unwrap() += 1;
                     }
+
+                    // let (term, is_leader) = node.lock().unwrap().get_state();
+                    // if is_leader && current_term.is_some() && term >= current_term.unwrap() {
+                    //     leaders.push((i, term));
+                    // }
                 }
             }
 
-            if leaders.len() == 1 {
-                return leaders[0];
-            } else if leaders.len() > 1 {
-                panic!("Expected 1 leader, got multiple: {:?}", leaders);
+            // leader_node, num_followers
+            let mut max_val: (usize, u8) = (0, 0);
+            for (k, v) in leader_map.iter() {
+                if max_val.1.cmp(v) == Ordering::Less {
+                    max_val = (*k, *v);
+                };
             }
+
+            if max_val.1 as usize > self.n.div(2) {
+                return (max_val.0, max_val.1 as u32);
+            }
+            // if leaders.len() == 1 {
+            //     return leaders[0];
+            // } else if leaders.len() > 1 {
+            //     panic!(
+            //         "Expected 1 leader, got multiple: {:?}, at term {:?}",
+            //         leaders, current_term
+            //     );
+            // }
         }
-        panic!("Expected 1 leader, got 0");
+        panic!("Expected 1 leader, got 0, at term {:?}", current_term);
     }
 
     pub fn disconnect(&self, i: usize) {

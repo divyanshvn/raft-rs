@@ -1,6 +1,7 @@
 use std::time::{self, UNIX_EPOCH};
 
 use anyhow::Result;
+use tracing::{event, Level};
 
 use crate::{
     node::Node,
@@ -36,10 +37,6 @@ impl RaftRpc for Node {
         latest_log_metadata: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
         let mut state = self.state.lock().unwrap();
-        println!(
-            "received request_to_vote at node {} from node {}",
-            state.id.0, candidate_id.0
-        );
         if term <= state.current_term {
             return Ok((state.current_term, false));
         }
@@ -58,8 +55,10 @@ impl RaftRpc for Node {
             state.current_term = term;
             // 05/25/2026 11:29 PM IST - TODO: should leader start its own election timer after this?
 
-            let mut leader_state = self.leader_state.lock().unwrap();
-            *leader_state = None;
+            // TODO: fix this bug, where leader_state will be None , but then it reflects
+
+            // let mut leader_state = self.leader_state.lock().unwrap();
+            // *leader_state = None;
         }
 
         if let Some(vote) = state.voted_for {
@@ -68,12 +67,14 @@ impl RaftRpc for Node {
 
             // candidate's term not greater than the voted term, hence we have already voted.
             if vote_term >= term {
+                event!(Level::DEBUG, "voted no.");
                 return Ok((state.current_term, false));
             }
         }
 
         // log up-to-date check
         if state.latest_log.gt(&latest_log_metadata) {
+            event!(Level::DEBUG, "voted no.");
             return Ok((state.current_term, false));
         }
 
@@ -93,9 +94,7 @@ impl RaftRpc for Node {
     ) -> anyhow::Result<(u32, bool)> {
         let mut state = self.state.lock().unwrap();
 
-        // println!("append_entries called of id {:?}, leader term: {term}, prev_log_metadata: {prev_log_metadata:?}, new logs: {logs :?}", state.id);
         if state.current_term > term {
-            // println!("append_entries failed 2, for peer {:?}", state.id);
             return Ok((state.current_term, false));
         }
         // 05/25/2026 02:04 PM IST - TODO: reset election timer
@@ -116,7 +115,6 @@ impl RaftRpc for Node {
             if match_index.is_none() {
                 // NOTE: Wrong hypothesis: there is no conflicting entry , but the node lacks latest entries.
                 // It's just that there might be conflicting entries but they can only be found when we get to know more(preceding) log entries
-                // println!("append_entries failed 1, for peer {:?}. Latest log: {:?} vs prev_log_metada: {:?}", state.id, state.latest_log, prev_log_metadata);
                 return Ok((state.current_term, false));
             }
 
@@ -142,10 +140,6 @@ impl RaftRpc for Node {
                 }
             }
         }
-        // println!(
-        //     "append_entries successful, for peer {:?}, metadata: {:?}",
-        //     state.id, state.latest_log
-        // );
 
         return Ok((state.current_term, true));
     }

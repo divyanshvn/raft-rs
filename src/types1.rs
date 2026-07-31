@@ -87,7 +87,7 @@ pub struct LeaderState {
     pub(crate) next_log_index: u32,   // next index of the log in the leader's logs[] array
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NodeType {
     Leader,
     Follower,
