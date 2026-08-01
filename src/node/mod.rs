@@ -74,7 +74,6 @@ impl Node {
     }
 
     pub async fn start(mut self, node_type: Option<NodeType>) -> Result<()> {
-        let mut timeout;
         {
             let mut state = self.state.lock().unwrap();
 
@@ -87,11 +86,13 @@ impl Node {
                     next_log_index: 1,
                 });
             }
-            timeout = state.timeout;
         }
 
         loop {
-            let node_type = { self.state.lock().unwrap().current_type.clone() };
+            let (node_type, id) = {
+                let state = self.state.lock().unwrap();
+                (state.current_type.clone(), state.id)
+            };
             match node_type {
                 NodeType::Leader => {
                     {
@@ -133,11 +134,13 @@ impl Node {
                         let time_since_leader_contact = current_time - last_leader_contact;
 
                         timeout = if time_since_leader_contact >= timeout {
+                            info!(id = id.0, "calling empty append_entries");
                             self.call_append_entries(vec![]).await.unwrap();
                             timeout
                         } else {
                             timeout - time_since_leader_contact
-                        }
+                        };
+                        debug!("onto next loop");
                     }
                 }
                 NodeType::Follower => {
@@ -172,9 +175,7 @@ impl Node {
 
                         // While, if the leader has contacted in between, then timeout restarts. But it should be such that the timer restarted when the new leader contacted it, not when the old timer finishes. Therefore, it will make more sense to deduct the time since last leader contact. Is that guaranteed to be > 0, might not be since this a distribution from timeout to 2*timeout, therefore if it is greater than such, in that case one should become a candidate.
                         timeout = new_election_timeout as u64;
-                        {
-                            self.state.lock().unwrap().timeout = timeout;
-                        }
+                        state.timeout = timeout;
                     }
                 }
                 NodeType::Candidate => {

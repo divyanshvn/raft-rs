@@ -120,11 +120,9 @@ impl Config {
     }
 
     pub async fn check_one_leader(&self, current_term: Option<u32>) -> (usize, u32) {
-        println!("hi");
-        thread::sleep(Duration::from_secs(1));
+        sleep(Duration::from_secs(1)).await;
         for _iters in 0..10 {
-            println!("_iter: {}", _iters);
-            thread::sleep(Duration::from_millis(500));
+            sleep(Duration::from_millis(500)).await;
 
             // let mut leaders = Vec::new();
             // leader-node-id to number of followers
