@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 use crate::raft_rpc::RaftRpcClient;
+use crate::utils::get_current_time;
 
 pub struct VoteRequest {}
 
@@ -56,7 +57,7 @@ pub struct NodeState {
     pub(crate) leader: Option<NodeId>, // maybe this should be option? , i am scared of the start.
     // Or maybe , on start/initialization, i will have a log: "start" which will also be marked as committed. with logIndex and term as 0, 0.
     pub(crate) id: NodeId,
-    pub(crate) min_timeout: u64, // maybe a duration , instead of just seconds. random interval will be added on top of it during election timeout computation.
+    pub(crate) timeout: u64, // maybe a duration , instead of just seconds. random interval will be added on top of it during election timeout computation.
     pub(crate) peers: Vec<RaftRpcClient>,
     pub(crate) last_applied: usize, // index into log_entries. MAKE SURE TO CHANGE WHEN DUMPING LOGS
     pub(crate) last_leader_contact: u64, // epoch of the last leader interaction
@@ -77,6 +78,14 @@ impl NodeState {
         }
 
         return None;
+    }
+
+    /// returns true if timed out.
+    pub fn check_timeout(&self) -> bool {
+        if self.last_leader_contact + self.timeout >= get_current_time() {
+            return true;
+        }
+        return false;
     }
 }
 

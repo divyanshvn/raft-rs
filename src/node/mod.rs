@@ -17,13 +17,13 @@ use tokio::{
     task::JoinHandle,
     time::{sleep, Sleep},
 };
-use tracing::{event, Level};
+use tracing::{debug, info, warn};
 
 use crate::{
     client_rpc::ClientRpc,
     raft_rpc::{RaftRpc, RaftRpcClient},
     types1::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
-    utils::{exceeds_majority, get_current_time, rand_election_timeout},
+    utils::{exceeds_majority, get_current_time, rand_election_timeout, MIN_TIMEOUT},
 };
 
 #[derive(Clone)]
@@ -33,7 +33,7 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(id: usize, min_timeout: u64, peers: &[RaftRpcClient]) -> Self {
+    pub fn new(id: usize, peers: &[RaftRpcClient]) -> Self {
         let zero_log_metadata = LogMetadata { term: 0, index: 0 };
         let mut leader_state = None;
         let mut current_type = NodeType::Follower;
@@ -50,7 +50,7 @@ impl Node {
             latest_log: zero_log_metadata,
             leader: None,
             id: NodeId(id),
-            min_timeout,
+            timeout: rand_election_timeout(MIN_TIMEOUT),
             peers: peers.to_vec(),
             last_applied: 0,
             last_leader_contact: get_current_time(),
@@ -74,7 +74,7 @@ impl Node {
     }
 
     pub async fn start(mut self, node_type: Option<NodeType>) -> Result<()> {
-        let mut min_timeout;
+        let mut timeout;
         {
             let mut state = self.state.lock().unwrap();
 
@@ -87,7 +87,7 @@ impl Node {
                     next_log_index: 1,
                 });
             }
-            min_timeout = state.min_timeout;
+            timeout = state.timeout;
         }
 
         loop {
@@ -97,11 +97,11 @@ impl Node {
                     {
                         let mut state = self.state.lock().unwrap();
                         state.last_leader_contact = get_current_time();
-                        event!(
-                            Level::DEBUG,
-                            "node {} is the leader now with term: {}",
-                            state.id.0,
-                            state.current_term
+                        debug!(
+                            node_id = state.id.0,
+                            term = state.current_term,
+                            latest_log_index = state.latest_log.index,
+                            "node is leader"
                         );
                         *(self.leader_state.lock().as_deref_mut().unwrap()) = Some(LeaderState {
                             match_index: vec![0; state.peers.len()],
@@ -112,8 +112,10 @@ impl Node {
                     self.call_append_entries(vec![]).await.unwrap();
                     // call appendEntries for all. (maybe if possible call its own reply_log)
 
+                    // NOTE: made this half of MIN_TIMEOUT to be on the safer side.
+                    let mut timeout = MIN_TIMEOUT / 2;
+
                     // need to spin up a task, that awaits for the tasks in task_queue
-                    let mut timeout = min_timeout;
                     loop {
                         let task = tokio::spawn(async move {
                             sleep(Duration::from_millis(timeout)).await;
@@ -130,17 +132,17 @@ impl Node {
                         let current_time = get_current_time();
                         let time_since_leader_contact = current_time - last_leader_contact;
 
-                        timeout = if time_since_leader_contact >= min_timeout {
+                        timeout = if time_since_leader_contact >= timeout {
                             self.call_append_entries(vec![]).await.unwrap();
-                            min_timeout
+                            timeout
                         } else {
-                            min_timeout - time_since_leader_contact
+                            timeout - time_since_leader_contact
                         }
                     }
                 }
                 NodeType::Follower => {
                     // election timeout monitor (maybe a loop based approach)
-                    let mut timeout = rand_election_timeout(min_timeout);
+                    let mut timeout = rand_election_timeout(MIN_TIMEOUT);
                     loop {
                         let task = tokio::spawn(async move {
                             sleep(Duration::from_millis(timeout)).await;
@@ -151,24 +153,28 @@ impl Node {
                         let mut state = self.state.lock().unwrap();
                         let current_time = get_current_time();
                         let time_since_leader_contact = current_time - state.last_leader_contact;
+                        let new_election_timeout = rand_election_timeout(MIN_TIMEOUT) as i64
+                            - time_since_leader_contact as i64;
 
-                        if time_since_leader_contact > timeout {
+                        // if time since the last leader contact > the timeout, then it needs to become a candidate.
+                        if time_since_leader_contact > timeout || new_election_timeout <= 0 {
                             state.current_type = NodeType::Candidate;
                             state.current_term += 1;
                             state.voted_for = Some((state.id, state.current_term));
+                            info!(
+                                node_id = state.id.0,
+                                term = state.current_term,
+                                timeout_ms = timeout,
+                                "election timeout elapsed"
+                            );
                             break;
                         }
 
-                        // otherwise, restart timer
-                        let new_election_timeout = rand_election_timeout(min_timeout);
-                        event!(
-                            Level::INFO,
-                            "new election timeout {}, old {}, time_since_leader_contact {}",
-                            new_election_timeout,
-                            timeout,
-                            time_since_leader_contact
-                        );
-                        timeout = new_election_timeout - (time_since_leader_contact - timeout);
+                        // While, if the leader has contacted in between, then timeout restarts. But it should be such that the timer restarted when the new leader contacted it, not when the old timer finishes. Therefore, it will make more sense to deduct the time since last leader contact. Is that guaranteed to be > 0, might not be since this a distribution from timeout to 2*timeout, therefore if it is greater than such, in that case one should become a candidate.
+                        timeout = new_election_timeout as u64;
+                        {
+                            self.state.lock().unwrap().timeout = timeout;
+                        }
                     }
                 }
                 NodeType::Candidate => {
@@ -176,13 +182,12 @@ impl Node {
                     let notify = Arc::new(Notify::new());
                     let num_votes = Arc::new(AtomicU32::new(1));
 
-                    let (id, current_term, peers, latest_log, min_timeout) = {
+                    let (id, current_term, peers, latest_log, timeout) = {
                         let state = self.state.lock().unwrap();
-                        event!(
-                            Level::DEBUG,
-                            "node {} is candidate for term: {}",
-                            state.id.0,
-                            state.current_term
+                        info!(
+                            node_id = state.id.0,
+                            term = state.current_term,
+                            "node became candidate"
                         );
                         let current_term = state.current_term;
                         let peers = state.peers.clone();
@@ -192,7 +197,7 @@ impl Node {
                             current_term,
                             peers,
                             state.latest_log,
-                            state.min_timeout,
+                            state.timeout,
                         )
                     };
                     let num_peers = peers.len();
@@ -234,7 +239,7 @@ impl Node {
 
                     let notify_cl = notify.clone();
                     let start_time = get_current_time();
-                    let election_timeout = rand_election_timeout(min_timeout);
+                    let election_timeout = rand_election_timeout(MIN_TIMEOUT);
                     // spawn an election timout
                     tokio::spawn(async move {
                         // 05/26/2026 02:24 PM IST - WARN: need to check whether this wakes up exactly after election_timeout secs.
@@ -258,6 +263,7 @@ impl Node {
                             let state = self.state.lock().unwrap();
                             (state.id.0, state.current_term)
                         };
+                        info!(node_id, term, num_votes, "election won");
                         {
                             let mut state = self.state.lock().unwrap();
                             state.current_type = NodeType::Leader;
@@ -313,6 +319,14 @@ impl Node {
 
             state.latest_log = log_metadata;
             state.last_leader_contact = get_current_time();
+            debug!(
+                node_id = state.id.0,
+                term = state.current_term,
+                entries = logs.len(),
+                prev_log_index = prev_log.index,
+                prev_log_term = prev_log.term,
+                "sending append_entries"
+            );
             (
                 state.peers.clone(),
                 state.id,
@@ -400,7 +414,24 @@ async fn append_entry_task(
 
     let response = match response {
         Ok(Ok(resp)) => resp,
-        _ => return,
+        Err(err) => {
+            debug!(
+                leader_id = id.0,
+                peer_index,
+                error = %err,
+                "append_entries rpc failed"
+            );
+            return;
+        }
+        Ok(Err(err)) => {
+            debug!(
+                leader_id = id.0,
+                peer_index,
+                error = %err,
+                "append_entries rejected by service"
+            );
+            return;
+        }
     };
     // 05/24/2026 06:28 PM IST - TODO: might not want to unwrap here.
 
@@ -412,6 +443,13 @@ async fn append_entry_task(
 
     // Handling for the scenarion wherin the response's term > current_term, which means that this node is no longer the leader.
     if response.0 > current_term {
+        warn!(
+            leader_id = id.0,
+            peer_index,
+            current_term,
+            peer_term = response.0,
+            "leader observed higher term"
+        );
         let mut state_locked = state.lock().unwrap();
         state_locked.current_type = NodeType::Follower;
         state_locked.current_term = response.0;

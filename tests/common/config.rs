@@ -6,6 +6,7 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ops::Div;
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tarpc::{client, server, server::Channel};
 use tokio::task::JoinHandle;
@@ -74,7 +75,7 @@ impl Config {
         }
 
         for i in 0..self.n {
-            let node = Node::new(i, 150, &proxy_clients);
+            let node = Node::new(i, &proxy_clients);
             nodes.insert(i, Mutex::new(node.clone()));
 
             // Serve the real node
@@ -119,9 +120,11 @@ impl Config {
     }
 
     pub async fn check_one_leader(&self, current_term: Option<u32>) -> (usize, u32) {
-        sleep(Duration::from_secs(5)).await;
+        println!("hi");
+        thread::sleep(Duration::from_secs(1));
         for _iters in 0..10 {
-            sleep(Duration::from_millis(500)).await;
+            println!("_iter: {}", _iters);
+            thread::sleep(Duration::from_millis(500));
 
             // let mut leaders = Vec::new();
             // leader-node-id to number of followers
@@ -129,6 +132,7 @@ impl Config {
 
             let nodes_map = self.nodes.clone();
             for i in 0..self.n {
+                println!("i: {i}");
                 if let Some(node) = nodes_map.get(&i) {
                     let leader = node.lock().unwrap().get_leader();
                     let Some(leader_node) = leader else {
@@ -156,6 +160,7 @@ impl Config {
             }
 
             if max_val.1 as usize > self.n.div(2) {
+                println!("bye");
                 return (max_val.0, max_val.1 as u32);
             }
             // if leaders.len() == 1 {
