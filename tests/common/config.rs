@@ -130,7 +130,6 @@ impl Config {
 
             let nodes_map = self.nodes.clone();
             for i in 0..self.n {
-                println!("i: {i}");
                 if let Some(node) = nodes_map.get(&i) {
                     let leader = node.lock().unwrap().get_leader();
                     let Some(leader_node) = leader else {
@@ -158,7 +157,6 @@ impl Config {
             }
 
             if max_val.1 as usize > self.n.div(2) {
-                println!("bye");
                 return (max_val.0, max_val.1 as u32);
             }
             // if leaders.len() == 1 {

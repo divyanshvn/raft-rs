@@ -79,7 +79,11 @@ impl RaftRpc for ProxyNode {
     ) -> Result<(u32, bool)> {
         let to = self.node_id;
         let from = leader_id.0;
-        self.network.simulate_network_delay(from, to).await?;
+        if self.network.simulate_network_delay(from, to).await.is_err() {
+            // Sleeping till Deadline to correctly stimulate network partition.
+            sleep(Duration::from_secs(50)).await;
+            return Err(anyhow::anyhow!("Network partitioned OH NOOOO"));
+        };
         let mut req_ctx = tarpc::context::current();
         req_ctx.deadline = context.deadline;
         let res = self

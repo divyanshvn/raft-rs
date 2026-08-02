@@ -32,31 +32,41 @@ async fn test_sleep() {
 #[tokio::test]
 async fn test_re_election() {
     common::tracing::init();
+    // console_subscriber::init();
 
     let cfg = Config::new(5).await;
+    let mut leaders = Vec::new();
 
     let (mut leader, mut term) = cfg.check_one_leader(None).await;
+    leaders.push(leader);
     info!(leader, term, "elected leader");
 
     for i in 0..10 {
-        info!(i, "iteration");
+        info!(i, history = format!("{:?}", leaders), "iteration");
         let old_leader = leader;
         cfg.disconnect(leader);
         let current_time = Instant::now();
 
         info!(previous_leader = old_leader, "waiting for new leader");
+        let before_time = Instant::now();
         (leader, term) = cfg.check_one_leader(Some(term)).await;
-        info!(leader, "elected replacement leader");
+        info!(
+            leader,
+            "elected replacement leader in {} ms",
+            (Instant::now() - before_time).as_millis()
+        );
+        leaders.push(leader);
         cfg.clients[&leader]
             .reply_log(context::current(), "test".to_string())
             .await
             .unwrap()
             .unwrap();
         info!(
-            elapsed_secs = (Instant::now() - current_time).as_secs(),
-            "re-election completed"
+            elapsed_ms = (Instant::now() - current_time).as_millis(),
+            "reply_log returned with reelection, with leader {}", leader
         );
         cfg.connect(old_leader);
+        info!(old_leader, "previour leader back online");
     }
     // The new leader should remain leader or another election happens, but there should be exactly one leader.
     // let leader3 = cfg.check_one_leader().await;

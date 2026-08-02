@@ -23,6 +23,13 @@ pub fn exceeds_majority(num: u32, total: usize) -> bool {
 }
 
 pub fn is_majority(num: u32, total: usize) -> bool {
+    if (num as usize) >= (total + 1).div_ceil(2) {
+        return true;
+    }
+    false
+}
+
+pub fn just_majority(num: u32, total: usize) -> bool {
     if (num as usize) == (total + 1).div_ceil(2) {
         return true;
     }

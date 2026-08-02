@@ -4,7 +4,7 @@ use tracing::{debug, info, warn};
 use crate::{
     node::Node,
     types1::{Log, LogMetadata, NodeId, NodeType},
-    utils::get_current_time,
+    utils::{get_current_time, MIN_TIMEOUT},
 };
 
 #[tarpc::service]
@@ -37,7 +37,7 @@ impl RaftRpc for Node {
         let mut state = self.state.lock().unwrap();
         if term <= state.current_term {
             debug!(
-                node_id = state.id.0,
+                node = state.id.0,
                 candidate_id = candidate_id.0,
                 requested_term = term,
                 current_term = state.current_term,
@@ -48,10 +48,9 @@ impl RaftRpc for Node {
 
         // 05/23/2026 02:37 PM IST - TODO: need to add LeaderStickiness part here. Not yet added.
         // Leader stickiness, wherein requestToVote is rejected if the follower thinks that a leader still exists.
-
-        if state.check_timeout() {
+        if state.last_leader_contact + MIN_TIMEOUT >= get_current_time() {
             debug!(
-                node_id = state.id.0,
+                node = state.id.0,
                 candidate_id = candidate_id.0,
                 requested_term = term,
                 "rejecting vote while leader contact is fresh"
@@ -62,7 +61,7 @@ impl RaftRpc for Node {
         if state.current_type == NodeType::Leader {
             // revert to follower
             info!(
-                node_id = state.id.0,
+                node = state.id.0,
                 old_term = state.current_term,
                 new_term = term,
                 "leader stepping down after vote request"
@@ -84,7 +83,7 @@ impl RaftRpc for Node {
             // candidate's term not greater than the voted term, hence we have already voted.
             if vote_term >= term {
                 debug!(
-                    node_id = state.id.0,
+                    node = state.id.0,
                     candidate_id = candidate_id.0,
                     requested_term = term,
                     voted_term = vote_term,
@@ -97,7 +96,7 @@ impl RaftRpc for Node {
         // log up-to-date check
         if state.latest_log.gt(&latest_log_metadata) {
             debug!(
-                node_id = state.id.0,
+                node = state.id.0,
                 candidate_id = candidate_id.0,
                 requested_term = term,
                 candidate_log_index = latest_log_metadata.index,
@@ -111,7 +110,7 @@ impl RaftRpc for Node {
 
         state.voted_for = Some((candidate_id, term));
         info!(
-            node_id = state.id.0,
+            node = state.id.0,
             candidate_id = candidate_id.0,
             term,
             "vote granted"
@@ -144,7 +143,7 @@ impl RaftRpc for Node {
         }
         if state.current_term > term {
             debug!(
-                node_id = state.id.0,
+                node = state.id.0,
                 leader_id = leader_id.0,
                 requested_term = term,
                 current_term = state.current_term,
@@ -153,24 +152,25 @@ impl RaftRpc for Node {
             return Ok((state.current_term, false));
         }
         // 05/25/2026 02:04 PM IST - TODO: reset election timer
+        if state.current_type == NodeType::Leader {
+            debug!(node = state.id.0, "Outdated leader");
+        }
 
         // Handles both outdated-term followers and competing candidates who lost.
-        if state.current_term <= term {
-            if state.current_type != NodeType::Follower
-                || state.leader.map(|leader| leader.0) != Some(leader_id.0)
-            {
-                info!(
-                    node_id = state.id.0,
-                    leader_id = leader_id.0,
-                    term,
-                    "accepted leader"
-                );
-            }
-            state.voted_for = None;
-            state.current_term = term;
-            state.leader = Some(leader_id);
-            state.current_type = NodeType::Follower;
+        if state.current_type != NodeType::Follower
+            || state.leader.map(|leader| leader.0) != Some(leader_id.0)
+        {
+            info!(
+                node = state.id.0,
+                leader_id = leader_id.0,
+                term,
+                "accepted leader"
+            );
         }
+        state.voted_for = None;
+        state.current_term = term;
+        state.leader = Some(leader_id);
+        state.current_type = NodeType::Follower;
 
         state.last_leader_contact = get_current_time();
 
@@ -181,7 +181,7 @@ impl RaftRpc for Node {
                 // NOTE: Wrong hypothesis: there is no conflicting entry , but the node lacks latest entries.
                 // It's just that there might be conflicting entries but they can only be found when we get to know more(preceding) log entries
                 debug!(
-                    node_id = state.id.0,
+                    node = state.id.0,
                     leader_id = leader_id.0,
                     prev_log_index = prev_log_metadata.index,
                     prev_log_term = prev_log_metadata.term,
@@ -192,7 +192,7 @@ impl RaftRpc for Node {
 
             // prune all logs after match_index
             debug!(
-                node_id = state.id.0,
+                node = state.id.0,
                 leader_id = leader_id.0,
                 match_index = match_index.unwrap(),
                 "truncating conflicting log entries"
@@ -206,11 +206,13 @@ impl RaftRpc for Node {
         // NOTE: assuming that the logs[] arrray isn't ever empty
         state.latest_log = state.logs.last().unwrap().metadata;
         debug!(
-            node_id = state.id.0,
+            node = state.id.0,
             leader_id = leader_id.0,
             appended,
             latest_log_index = state.latest_log.index,
             latest_log_term = state.latest_log.term,
+            logs = format!("{:?}", logs),
+            state = format!("{:?}", state.current_type),
             "append_entries accepted"
         );
 

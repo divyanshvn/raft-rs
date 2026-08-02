@@ -6,10 +6,11 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Result};
+use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use tarpc::context;
 use tokio::{
@@ -23,7 +24,10 @@ use crate::{
     client_rpc::ClientRpc,
     raft_rpc::{RaftRpc, RaftRpcClient},
     types1::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
-    utils::{exceeds_majority, get_current_time, rand_election_timeout, MIN_TIMEOUT},
+    utils::{
+        exceeds_majority, get_current_time, is_majority, just_majority, rand_election_timeout,
+        MIN_TIMEOUT,
+    },
 };
 
 #[derive(Clone)]
@@ -99,7 +103,7 @@ impl Node {
                         let mut state = self.state.lock().unwrap();
                         state.last_leader_contact = get_current_time();
                         debug!(
-                            node_id = state.id.0,
+                            node = state.id.0,
                             term = state.current_term,
                             latest_log_index = state.latest_log.index,
                             "node is leader"
@@ -110,7 +114,8 @@ impl Node {
                         });
                     }
                     // initialize (or even re-initialize in some state vars case) the state variables accordingly
-                    self.call_append_entries(vec![]).await.unwrap();
+                    // TODO: I Shouldn't be not unwrapping here.
+                    self.call_append_entries(vec![]).await;
                     // call appendEntries for all. (maybe if possible call its own reply_log)
 
                     // NOTE: made this half of MIN_TIMEOUT to be on the safer side.
@@ -122,36 +127,57 @@ impl Node {
                             sleep(Duration::from_millis(timeout)).await;
                         });
                         task.await.unwrap();
+                        debug!(node = id.0, "leader timer up");
 
                         let (last_leader_contact, current_type) = {
                             let state = self.state.lock().unwrap();
                             (state.last_leader_contact, state.current_type.clone())
                         };
                         if current_type != NodeType::Leader {
+                            debug!(
+                                node = id.0,
+                                state = format!("{:?}", current_type),
+                                "no longer the leader"
+                            );
                             break;
                         }
                         let current_time = get_current_time();
                         let time_since_leader_contact = current_time - last_leader_contact;
 
                         timeout = if time_since_leader_contact >= timeout {
-                            info!(id = id.0, "calling empty append_entries");
-                            self.call_append_entries(vec![]).await.unwrap();
+                            info!(
+                                node = id.0,
+                                state = format!("{:?}", current_type),
+                                "calling empty append_entries"
+                            );
+                            debug!(node = id.0, "calling append_entries");
+                            // TODO: I Shouldn't be not unwrapping here.
+                            self.call_append_entries(vec![]).await;
+                            debug!(node = id.0, "append_entries done");
                             timeout
                         } else {
                             timeout - time_since_leader_contact
                         };
-                        debug!("onto next loop");
                     }
+                    debug!(node = id.0, "got out of leader loop");
                 }
                 NodeType::Follower => {
                     // election timeout monitor (maybe a loop based approach)
                     let mut timeout = rand_election_timeout(MIN_TIMEOUT);
+                    debug!(node = id.0, timeout, "becoming follower now");
                     loop {
+                        debug!(timeout, node = id.0, "going to sleep");
+                        let current_time = Instant::now();
                         let task = tokio::spawn(async move {
                             sleep(Duration::from_millis(timeout)).await;
                         });
-
                         task.await.unwrap();
+                        debug!(
+                            timeout,
+                            node = id.0,
+                            "got out of sleep after {} ms",
+                            current_time.elapsed().as_millis()
+                        );
 
                         let mut state = self.state.lock().unwrap();
                         let current_time = get_current_time();
@@ -186,7 +212,7 @@ impl Node {
                     let (id, current_term, peers, latest_log, timeout) = {
                         let state = self.state.lock().unwrap();
                         info!(
-                            node_id = state.id.0,
+                            node = state.id.0,
                             term = state.current_term,
                             "node became candidate"
                         );
@@ -264,7 +290,7 @@ impl Node {
                             let state = self.state.lock().unwrap();
                             (state.id.0, state.current_term)
                         };
-                        info!(node_id, term, num_votes, "election won");
+                        info!(node = node_id, term, num_votes, "election won");
                         {
                             let mut state = self.state.lock().unwrap();
                             state.current_type = NodeType::Leader;
@@ -338,7 +364,10 @@ impl Node {
             )
         };
         // NOTE: Locks DROPPED here
-        let replica_count = Arc::new(AtomicU32::new(1));
+        let count = ConsensusCount {
+            accepted: Arc::new(AtomicU32::new(1)),
+            failed: Arc::new(AtomicU32::new(0)),
+        };
         let notify = Arc::new(Notify::new());
         let mut tasks = Vec::new();
 
@@ -348,7 +377,7 @@ impl Node {
                 continue;
             }
 
-            let rc_cl = replica_count.clone();
+            let count_cl = count.clone();
             let peer_c = peer.clone();
             let state_c = self.state.clone();
             let leader_state_c = self.leader_state.clone();
@@ -360,7 +389,7 @@ impl Node {
                 append_entry_task(
                     logs_cl,
                     peer_c,
-                    rc_cl,
+                    count_cl,
                     id,
                     commit_index,
                     current_term,
@@ -378,15 +407,25 @@ impl Node {
 
         notify.notified().await;
 
-        Ok(())
+        if is_majority(count.accepted.load(Ordering::SeqCst), peers.len()) {
+            Ok(())
+        } else {
+            Err(anyhow!("Majority of append_entries failed"))
+        }
     }
+}
+
+#[derive(Clone)]
+struct ConsensusCount {
+    accepted: Arc<AtomicU32>,
+    failed: Arc<AtomicU32>,
 }
 
 // called by the leader, handles sending appendEntries RPC to follower
 async fn append_entry_task(
     logs: Vec<Log>,
     peer: RaftRpcClient,
-    rc_cl: Arc<AtomicU32>,
+    count: ConsensusCount,
     id: NodeId,
     commit_index: LogMetadata,
     current_term: u32,
@@ -416,6 +455,7 @@ async fn append_entry_task(
     let response = match response {
         Ok(Ok(resp)) => resp,
         Err(err) => {
+            handle_rpc_failure(count.failed, notify, state);
             debug!(
                 leader_id = id.0,
                 peer_index,
@@ -425,6 +465,7 @@ async fn append_entry_task(
             return;
         }
         Ok(Err(err)) => {
+            handle_rpc_failure(count.failed, notify, state);
             debug!(
                 leader_id = id.0,
                 peer_index,
@@ -438,7 +479,14 @@ async fn append_entry_task(
 
     if response.1 {
         // append_entries is successful
-        handle_successful_append(state, leader_state, rc_cl, latest_metadata, id.0, notify);
+        handle_successful_append(
+            state,
+            leader_state,
+            count.accepted,
+            latest_metadata,
+            id.0,
+            notify,
+        );
         return;
     }
 
@@ -490,7 +538,7 @@ async fn append_entry_task(
             handle_successful_append(
                 state,
                 leader_state,
-                rc_cl,
+                count.accepted,
                 latest_metadata,
                 peer_index,
                 notify,
@@ -500,19 +548,27 @@ async fn append_entry_task(
     }
 }
 
+fn handle_rpc_failure(failed: Arc<AtomicU32>, notify: Arc<Notify>, state: Arc<Mutex<NodeState>>) {
+    let num_nodes = { state.lock().unwrap().peers.len() };
+    let failed = failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if is_majority(failed, num_nodes) {
+        notify.notify_one();
+    }
+}
+
 // called by leader
 fn handle_successful_append(
     state: Arc<Mutex<NodeState>>,
     leader_state: Arc<Mutex<Option<LeaderState>>>,
-    replica_count: Arc<AtomicU32>,
+    accepted_count: Arc<AtomicU32>,
     metadata: LogMetadata,
     i: usize,
     notify: Arc<Notify>,
 ) {
     let mut state_lock = state.lock().unwrap();
-    let count = replica_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let count = accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
-    if count == ((state_lock.peers.len() + 1).div_ceil(2) as u32) {
+    if just_majority(count, state_lock.peers.len()) {
         // signal that majority is achieved
         if metadata.gt(&state_lock.commit_index) {
             state_lock.commit_index = metadata;
