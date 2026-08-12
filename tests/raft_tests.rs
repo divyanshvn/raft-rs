@@ -43,13 +43,13 @@ async fn test_re_election() {
 
     for i in 0..10 {
         info!(i, history = format!("{:?}", leaders), "iteration");
-        let old_leader = leader;
         cfg.disconnect(leader);
+        let old_leader = leader;
         let current_time = Instant::now();
 
         info!(previous_leader = old_leader, "waiting for new leader");
         let before_time = Instant::now();
-        (leader, term) = cfg.check_one_leader(Some(term)).await;
+        (leader, _) = cfg.check_one_leader(None).await;
         info!(
             leader,
             "elected replacement leader in {} ms",

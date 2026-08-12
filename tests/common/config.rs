@@ -149,15 +149,25 @@ impl Config {
             }
 
             // leader_node, num_followers
-            let mut max_val: (usize, u8) = (0, 0);
+            struct MaxVal {
+                leader_node: usize,
+                num_followers: u8,
+            }
+            let mut max_val = MaxVal {
+                leader_node: 0,
+                num_followers: 0,
+            };
             for (k, v) in leader_map.iter() {
-                if max_val.1.cmp(v) == Ordering::Less {
-                    max_val = (*k, *v);
+                if max_val.num_followers.cmp(v) == Ordering::Less {
+                    max_val = MaxVal {
+                        leader_node: *k,
+                        num_followers: *v,
+                    };
                 };
             }
 
-            if max_val.1 as usize > self.n.div(2) {
-                return (max_val.0, max_val.1 as u32);
+            if max_val.num_followers as usize > self.n.div(2) {
+                return (max_val.leader_node, max_val.num_followers as u32);
             }
             // if leaders.len() == 1 {
             //     return leaders[0];

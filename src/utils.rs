@@ -1,6 +1,6 @@
 use std::time::{self, UNIX_EPOCH};
 
-pub const MIN_TIMEOUT: u64 = 100; // 100 mili-seconds
+pub const MIN_TIMEOUT: u64 = 500; // 100 mili-seconds
 
 pub fn get_current_time() -> u64 {
     time::SystemTime::now()

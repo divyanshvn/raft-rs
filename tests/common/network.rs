@@ -42,7 +42,7 @@ impl Network {
 
     pub async fn simulate_network_delay(&self, from: usize, to: usize) -> Result<()> {
         if !self.is_connected(from, to) {
-            sleep(Duration::from_millis(50)).await;
+            // sleep(Duration::from_millis(50)).await;
             return Err(anyhow::anyhow!("Network partitioned"));
         }
 
@@ -81,7 +81,7 @@ impl RaftRpc for ProxyNode {
         let from = leader_id.0;
         if self.network.simulate_network_delay(from, to).await.is_err() {
             // Sleeping till Deadline to correctly stimulate network partition.
-            sleep(Duration::from_secs(50)).await;
+            sleep(Duration::from_secs(10)).await;
             return Err(anyhow::anyhow!("Network partitioned OH NOOOO"));
         };
         let mut req_ctx = tarpc::context::current();

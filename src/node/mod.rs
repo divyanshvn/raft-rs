@@ -449,9 +449,13 @@ async fn append_entry_task(
         logs = format!("{:?}", logs),
         "sending append_entries"
     );
+    let mut context = context::Context::current();
+    let deadline_duration = Duration::from_millis(MIN_TIMEOUT);
+    context.deadline = Instant::now() + deadline_duration;
+
     let response = peer
         .append_entries(
-            context::current(),
+            context,
             current_term,
             leader_id,
             prev_log,
