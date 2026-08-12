@@ -34,7 +34,7 @@ impl RaftRpc for Node {
         candidate_id: NodeId,
         latest_log_metadata: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         if term <= state.current_term {
             debug!(
                 node = state.id.0,
@@ -72,7 +72,7 @@ impl RaftRpc for Node {
 
             // TODO: fix this bug, where leader_state will be None , but then it reflects
 
-            // let mut leader_state = self.leader_state.lock().unwrap();
+            // let mut leader_state = self.leader_state.lock().await;
             // *leader_state = None;
         }
 
@@ -128,7 +128,7 @@ impl RaftRpc for Node {
         logs: Vec<Log>,
         leader_commit: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
         debug!(
             node = state.id.0,
             logs = format!("{:?}", logs),

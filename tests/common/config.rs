@@ -131,7 +131,7 @@ impl Config {
             let nodes_map = self.nodes.clone();
             for i in 0..self.n {
                 if let Some(node) = nodes_map.get(&i) {
-                    let leader = node.lock().unwrap().get_leader();
+                    let leader = node.lock().unwrap().get_leader().await;
                     let Some(leader_node) = leader else {
                         continue;
                     };

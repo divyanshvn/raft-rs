@@ -4,7 +4,7 @@ use std::{
     ops::DerefMut,
     sync::{
         atomic::{AtomicU32, Ordering},
-        Arc, Mutex,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -14,7 +14,7 @@ use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use tarpc::context;
 use tokio::{
-    sync::Notify,
+    sync::{Mutex, Notify},
     task::JoinHandle,
     time::{sleep, Sleep},
 };
@@ -63,24 +63,24 @@ impl Node {
         }
     }
 
-    pub fn get_state(&self) -> (u32, bool) {
-        let state = self.state.lock().unwrap();
+    pub async fn get_state(&self) -> (u32, bool) {
+        let state = self.state.lock().await;
         (state.current_term, state.current_type == NodeType::Leader)
     }
 
-    pub fn get_leader(&self) -> Option<usize> {
-        let state = self.state.lock().unwrap();
+    pub async fn get_leader(&self) -> Option<usize> {
+        let state = self.state.lock().await;
         let leader = state.leader?;
         Some(leader.0)
     }
 
     pub async fn start(mut self, node_type: Option<NodeType>) -> Result<()> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().await;
 
             state.current_type = node_type.unwrap_or(NodeType::Follower);
             if state.current_type == NodeType::Leader {
-                let mut mu = self.leader_state.lock().unwrap();
+                let mut mu = self.leader_state.lock().await;
                 state.current_term = 1;
                 *mu = Some(LeaderState {
                     match_index: vec![0; state.peers.len()],
@@ -92,13 +92,13 @@ impl Node {
 
         loop {
             let (node_type, id) = {
-                let state = self.state.lock().unwrap();
+                let state = self.state.lock().await;
                 (state.current_type.clone(), state.id)
             };
             match node_type {
                 NodeType::Leader => {
                     {
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = self.state.lock().await;
                         state.last_leader_contact = get_current_time();
                         debug!(
                             node = state.id.0,
@@ -106,7 +106,7 @@ impl Node {
                             latest_log_index = state.latest_log.index,
                             "node is leader"
                         );
-                        *(self.leader_state.lock().as_deref_mut().unwrap()) = Some(LeaderState {
+                        *(self.leader_state.lock().await) = Some(LeaderState {
                             match_index: vec![0; state.peers.len()],
                             next_log_index: state.latest_log.index + 1,
                             catchup_tracker: HashMap::new(),
@@ -129,7 +129,7 @@ impl Node {
                         debug!(node = id.0, "leader timer up");
 
                         let (last_leader_contact, current_type) = {
-                            let state = self.state.lock().unwrap();
+                            let state = self.state.lock().await;
                             (state.last_leader_contact, state.current_type.clone())
                         };
                         if current_type != NodeType::Leader {
@@ -178,7 +178,7 @@ impl Node {
                             current_time.elapsed().as_millis()
                         );
 
-                        let mut state = self.state.lock().unwrap();
+                        let mut state = self.state.lock().await;
                         let current_time = get_current_time();
                         let time_since_leader_contact = current_time - state.last_leader_contact;
                         let new_election_timeout = rand_election_timeout(MIN_TIMEOUT) as i64
@@ -209,7 +209,7 @@ impl Node {
                     let num_votes = Arc::new(AtomicU32::new(1));
 
                     let (id, current_term, peers, latest_log, timeout) = {
-                        let state = self.state.lock().unwrap();
+                        let state = self.state.lock().await;
                         info!(
                             node = state.id.0,
                             term = state.current_term,
@@ -286,12 +286,12 @@ impl Node {
                     if is_majority(num_votes, num_peers) {
                         // convert to leader
                         let (node_id, term) = {
-                            let state = self.state.lock().unwrap();
+                            let state = self.state.lock().await;
                             (state.id.0, state.current_term)
                         };
                         info!(node = node_id, term, num_votes, "election won");
                         {
-                            let mut state = self.state.lock().unwrap();
+                            let mut state = self.state.lock().await;
                             state.current_type = NodeType::Leader;
                         }
                         continue;
@@ -299,7 +299,7 @@ impl Node {
 
                     if get_current_time() - start_time >= election_timeout {
                         // check current NodeType
-                        let mut state_locked = self.state.lock().unwrap();
+                        let mut state_locked = self.state.lock().await;
                         if state_locked.current_type == NodeType::Follower {
                             continue;
                         }
@@ -316,12 +316,12 @@ impl Node {
 
     pub async fn call_append_entries(&mut self, logs_str: Vec<String>) -> Result<()> {
         let (peers, leader_id, logs, commit_index, current_term, prev_log) = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock().await;
 
             if state.current_type != NodeType::Leader {
                 return Err(anyhow!("Current_node : {:?}, current_state: {:?}, call_append_entries called by non-leader", state.id, state.current_type));
             }
-            let mut leader_state = self.leader_state.lock().unwrap();
+            let mut leader_state = self.leader_state.lock().await;
 
             let mut logs = Vec::new();
             let mut next_log_index = leader_state.as_ref().unwrap().next_log_index;
@@ -469,20 +469,24 @@ async fn append_entry_task(
     let response = match response {
         Ok(Ok(resp)) => resp,
         Err(err) => {
-            handle_rpc_failure(count.failed, notify, state);
+            handle_rpc_failure(count.failed, notify, state).await;
             debug!(
-                leader_id = leader_id.0,
-                id,
+                node = id,
+                logs = format!("{:?}", logs),
+                term = current_term,
+                leader = leader_id.0,
                 error = %err,
                 "append_entries rpc failed"
             );
             return;
         }
         Ok(Err(err)) => {
-            handle_rpc_failure(count.failed, notify, state);
+            handle_rpc_failure(count.failed, notify, state).await;
             debug!(
-                leader_id = leader_id.0,
-                id,
+                node = id,
+                logs = format!("{:?}", logs),
+                term = current_term,
+                leader = leader_id.0,
                 error = %err,
                 "append_entries rejected by service"
             );
@@ -493,7 +497,8 @@ async fn append_entry_task(
 
     if response.1 {
         // append_entries is successful
-        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
+        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify)
+            .await;
         return;
     }
 
@@ -506,7 +511,7 @@ async fn append_entry_task(
             peer_term = response.0,
             "leader observed higher term"
         );
-        let mut state_locked = state.lock().unwrap();
+        let mut state_locked = state.lock().await;
         state_locked.current_type = NodeType::Follower;
         state_locked.current_term = response.0;
         let failed = count
@@ -516,14 +521,14 @@ async fn append_entry_task(
         if is_majority(failed, state_locked.peers.len()) {
             notify.notify_one();
         }
-        let mut leader_state_locked = leader_state.lock().unwrap();
+        let mut leader_state_locked = leader_state.lock().await;
         // TODO: what happens to the heap allocation when i make it None?
         *leader_state_locked = None;
         return;
     }
 
-    if !node_is_leader(&state) {
-        handle_rpc_failure(count.failed, notify, state);
+    if !node_is_leader(&state).await {
+        handle_rpc_failure(count.failed, notify, state).await;
         debug!(
             node = id,
             logs = format!("{:?}", logs),
@@ -532,18 +537,19 @@ async fn append_entry_task(
         return;
     }
 
-    if let Some(catchup_notify) = check_catchup(&leader_state, leader_id, latest_metadata) {
+    if let Some(catchup_notify) = check_catchup(&leader_state, leader_id, latest_metadata).await {
         catchup_notify.notified().await;
-        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
+        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify)
+            .await;
         return;
     };
 
     // handle failed append_entries, i.e. the follower needs to catch up
     let mut entries = VecDeque::from(logs);
     let catch_notify = Arc::new(Notify::new());
-    insert_catchup_tracker(&leader_state, id, latest_metadata, catch_notify.clone());
+    insert_catchup_tracker(&leader_state, id, latest_metadata, catch_notify.clone()).await;
 
-    let logs = { state.lock().unwrap().logs.clone() };
+    let logs = { state.lock().await.logs.clone() };
     // iteration starts from 1 because at initialization all logs contain the "START" log.
     for j in (1..(logs.len() - 1)).rev() {
         // check_state_and_handle_rpc_failure(count.failed, notify.clone(), state.clone());
@@ -569,25 +575,26 @@ async fn append_entry_task(
         };
         if response.1 {
             // append_entries is successful
-            handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
+            handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify)
+                .await;
             catch_notify.notify_waiters();
             return;
         }
     }
 }
 
-fn node_is_leader(state: &Mutex<NodeState>) -> bool {
-    let state_locked = state.lock().unwrap();
+async fn node_is_leader(state: &Mutex<NodeState>) -> bool {
+    let state_locked = state.lock().await;
     state_locked.current_type == NodeType::Leader
 }
 
-fn insert_catchup_tracker(
+async fn insert_catchup_tracker(
     leader_state: &Mutex<Option<LeaderState>>,
     id: usize,
     latest_metadata: LogMetadata,
     catchup_notify: Arc<Notify>,
 ) {
-    let mut leader_state_locked = leader_state.lock().unwrap();
+    let mut leader_state_locked = leader_state.lock().await;
     leader_state_locked
         .as_mut()
         .unwrap()
@@ -595,22 +602,22 @@ fn insert_catchup_tracker(
         .insert((NodeId(id), latest_metadata.index), catchup_notify);
 }
 
-fn check_catchup(
+async fn check_catchup(
     leader_state: &Mutex<Option<LeaderState>>,
     id: NodeId,
     latest_metadata: LogMetadata,
 ) -> Option<Arc<Notify>> {
-    let leader_state_locked = leader_state.lock().unwrap();
+    let leader_state_locked = leader_state.lock().await;
     let catchup_tracker = &leader_state_locked.as_ref().unwrap().catchup_tracker;
     catchup_tracker.get(&(id, latest_metadata.index)).cloned()
 }
 
-fn check_state_and_handle_rpc_failure(
+async fn check_state_and_handle_rpc_failure(
     failed: Arc<AtomicU32>,
     notify: Arc<Notify>,
     state: Arc<Mutex<NodeState>>,
 ) {
-    let state_lock = state.lock().unwrap();
+    let state_lock = state.lock().await;
     if state_lock.current_type == NodeType::Leader {
         return;
     }
@@ -621,8 +628,12 @@ fn check_state_and_handle_rpc_failure(
     }
 }
 
-fn handle_rpc_failure(failed: Arc<AtomicU32>, notify: Arc<Notify>, state: Arc<Mutex<NodeState>>) {
-    let num_nodes = { state.lock().unwrap().peers.len() };
+async fn handle_rpc_failure(
+    failed: Arc<AtomicU32>,
+    notify: Arc<Notify>,
+    state: Arc<Mutex<NodeState>>,
+) {
+    let num_nodes = { state.lock().await.peers.len() };
     let failed = failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     if is_majority(failed, num_nodes) {
         notify.notify_one();
@@ -630,14 +641,14 @@ fn handle_rpc_failure(failed: Arc<AtomicU32>, notify: Arc<Notify>, state: Arc<Mu
 }
 
 // called by leader
-fn handle_successful_append(
+async fn handle_successful_append(
     state: Arc<Mutex<NodeState>>,
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     accepted_count: Arc<AtomicU32>,
     metadata: LogMetadata,
     notify: Arc<Notify>,
 ) {
-    let mut state_lock = state.lock().unwrap();
+    let mut state_lock = state.lock().await;
     // TODO: why is this causing issue?
     if state_lock.current_type != NodeType::Leader {
         // debug!(
@@ -659,7 +670,7 @@ fn handle_successful_append(
 
     drop(state_lock);
 
-    // let mut binding = leader_state.lock().unwrap();
+    // let mut binding = leader_state.lock().await;
     // 06/19/2026 09:32 PM IST - TODO: fix this bug of leader_state becoming None
 
     // let leader_state = binding.as_mut().unwrap();
