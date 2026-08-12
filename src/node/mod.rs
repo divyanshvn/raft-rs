@@ -1,6 +1,6 @@
 use core::range;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     ops::DerefMut,
     sync::{
         atomic::{AtomicU32, Ordering},
@@ -24,10 +24,7 @@ use crate::{
     client_rpc::ClientRpc,
     raft_rpc::{RaftRpc, RaftRpcClient},
     types1::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
-    utils::{
-        exceeds_majority, get_current_time, is_majority, just_majority, rand_election_timeout,
-        MIN_TIMEOUT,
-    },
+    utils::{get_current_time, is_majority, just_majority, rand_election_timeout, MIN_TIMEOUT},
 };
 
 #[derive(Clone)]
@@ -88,6 +85,7 @@ impl Node {
                 *mu = Some(LeaderState {
                     match_index: vec![0; state.peers.len()],
                     next_log_index: 1,
+                    catchup_tracker: HashMap::new(),
                 });
             }
         }
@@ -111,6 +109,7 @@ impl Node {
                         *(self.leader_state.lock().as_deref_mut().unwrap()) = Some(LeaderState {
                             match_index: vec![0; state.peers.len()],
                             next_log_index: state.latest_log.index + 1,
+                            catchup_tracker: HashMap::new(),
                         });
                     }
                     // initialize (or even re-initialize in some state vars case) the state variables accordingly
@@ -284,7 +283,7 @@ impl Node {
                         continue;
                     }
 
-                    if exceeds_majority(num_votes, num_peers) {
+                    if is_majority(num_votes, num_peers) {
                         // convert to leader
                         let (node_id, term) = {
                             let state = self.state.lock().unwrap();
@@ -316,7 +315,7 @@ impl Node {
     }
 
     pub async fn call_append_entries(&mut self, logs_str: Vec<String>) -> Result<()> {
-        let (peers, id, logs, commit_index, current_term, prev_log) = {
+        let (peers, leader_id, logs, commit_index, current_term, prev_log) = {
             let mut state = self.state.lock().unwrap();
 
             if state.current_type != NodeType::Leader {
@@ -373,7 +372,7 @@ impl Node {
 
         for (i, peer) in peers.iter().enumerate() {
             // skip the leader ofcourse
-            if i == id.0 {
+            if i == leader_id.0 {
                 continue;
             }
 
@@ -386,11 +385,12 @@ impl Node {
 
             let notify_cl = notify.clone();
             let task = tokio::spawn(async move {
+                debug!("spawning append_entries task node={}", i);
                 append_entry_task(
                     logs_cl,
                     peer_c,
                     count_cl,
-                    id,
+                    leader_id,
                     commit_index,
                     current_term,
                     prev_log,
@@ -400,6 +400,7 @@ impl Node {
                     notify_cl,
                 )
                 .await;
+                debug!("append_entries task finished node={}", i);
             });
 
             tasks.push(task);
@@ -410,6 +411,7 @@ impl Node {
         if is_majority(count.accepted.load(Ordering::SeqCst), peers.len()) {
             Ok(())
         } else {
+            debug!("Majority of append_entries failed");
             Err(anyhow!("Majority of append_entries failed"))
         }
     }
@@ -426,11 +428,11 @@ async fn append_entry_task(
     logs: Vec<Log>,
     peer: RaftRpcClient,
     count: ConsensusCount,
-    id: NodeId,
+    leader_id: NodeId,
     commit_index: LogMetadata,
     current_term: u32,
     prev_log: LogMetadata,
-    peer_index: usize,
+    id: usize,
     state: Arc<Mutex<NodeState>>,
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     notify: Arc<Notify>,
@@ -441,24 +443,36 @@ async fn append_entry_task(
     } else {
         logs.last().unwrap().metadata
     };
+
+    debug!(
+        node = id,
+        logs = format!("{:?}", logs),
+        "sending append_entries"
+    );
     let response = peer
         .append_entries(
             context::current(),
             current_term,
-            id,
+            leader_id,
             prev_log,
             logs.clone(),
             commit_index,
         )
         .await;
 
+    debug!(
+        node = id,
+        logs = format!("{:?}", logs),
+        "append_entries sent"
+    );
+
     let response = match response {
         Ok(Ok(resp)) => resp,
         Err(err) => {
             handle_rpc_failure(count.failed, notify, state);
             debug!(
-                leader_id = id.0,
-                peer_index,
+                leader_id = leader_id.0,
+                id,
                 error = %err,
                 "append_entries rpc failed"
             );
@@ -467,8 +481,8 @@ async fn append_entry_task(
         Ok(Err(err)) => {
             handle_rpc_failure(count.failed, notify, state);
             debug!(
-                leader_id = id.0,
-                peer_index,
+                leader_id = leader_id.0,
+                id,
                 error = %err,
                 "append_entries rejected by service"
             );
@@ -479,22 +493,15 @@ async fn append_entry_task(
 
     if response.1 {
         // append_entries is successful
-        handle_successful_append(
-            state,
-            leader_state,
-            count.accepted,
-            latest_metadata,
-            id.0,
-            notify,
-        );
+        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
         return;
     }
 
     // Handling for the scenarion wherin the response's term > current_term, which means that this node is no longer the leader.
     if response.0 > current_term {
         warn!(
-            leader_id = id.0,
-            peer_index,
+            leader_id = leader_id.0,
+            id,
             current_term,
             peer_term = response.0,
             "leader observed higher term"
@@ -502,32 +509,59 @@ async fn append_entry_task(
         let mut state_locked = state.lock().unwrap();
         state_locked.current_type = NodeType::Follower;
         state_locked.current_term = response.0;
+        let failed = count
+            .failed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if is_majority(failed, state_locked.peers.len()) {
+            notify.notify_one();
+        }
         let mut leader_state_locked = leader_state.lock().unwrap();
+        // TODO: what happens to the heap allocation when i make it None?
         *leader_state_locked = None;
         return;
     }
 
+    if !node_is_leader(&state) {
+        handle_rpc_failure(count.failed, notify, state);
+        debug!(
+            node = id,
+            logs = format!("{:?}", logs),
+            "node is not leader, aborting append_entries"
+        );
+        return;
+    }
+
+    if let Some(catchup_notify) = check_catchup(&leader_state, leader_id, latest_metadata) {
+        catchup_notify.notified().await;
+        handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
+        return;
+    };
+
     // handle failed append_entries, i.e. the follower needs to catch up
     let mut entries = VecDeque::from(logs);
+    let catch_notify = Arc::new(Notify::new());
+    insert_catchup_tracker(&leader_state, id, latest_metadata, catch_notify.clone());
+
     let logs = { state.lock().unwrap().logs.clone() };
     // iteration starts from 1 because at initialization all logs contain the "START" log.
     for j in (1..(logs.len() - 1)).rev() {
+        // check_state_and_handle_rpc_failure(count.failed, notify.clone(), state.clone());
         let prev_log = logs[j - 1].metadata;
         entries.push_front(logs[j].clone());
-        // 05/25/2026 12:34 PM IST - TODO: This is slightly inefficient. Scenario: node j is already being caught up through another task, but here, i am doing this iteration again.
-        // 05/25/2026 12:35 PM IST - TODO: MAJOR!! THIS MIGHT EVEN LEAD TO AN ISSUE , where in-between of these iterations, another task updates to a more updated version of logs, but then this decreases them.
 
-        // update one by one?
         let response = peer
             .append_entries(
                 context::current(),
                 current_term,
-                id,
+                leader_id,
                 prev_log,
                 entries.clone().into(),
                 commit_index,
             )
             .await;
+
+        // NOTE: I am not sure about the case where the node isn't the leader anymore, but this iteration keeps on going.
 
         let response = match response {
             Ok(Ok(resp)) => resp,
@@ -535,16 +569,55 @@ async fn append_entry_task(
         };
         if response.1 {
             // append_entries is successful
-            handle_successful_append(
-                state,
-                leader_state,
-                count.accepted,
-                latest_metadata,
-                peer_index,
-                notify,
-            );
+            handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify);
+            catch_notify.notify_waiters();
             return;
         }
+    }
+}
+
+fn node_is_leader(state: &Mutex<NodeState>) -> bool {
+    let state_locked = state.lock().unwrap();
+    state_locked.current_type == NodeType::Leader
+}
+
+fn insert_catchup_tracker(
+    leader_state: &Mutex<Option<LeaderState>>,
+    id: usize,
+    latest_metadata: LogMetadata,
+    catchup_notify: Arc<Notify>,
+) {
+    let mut leader_state_locked = leader_state.lock().unwrap();
+    leader_state_locked
+        .as_mut()
+        .unwrap()
+        .catchup_tracker
+        .insert((NodeId(id), latest_metadata.index), catchup_notify);
+}
+
+fn check_catchup(
+    leader_state: &Mutex<Option<LeaderState>>,
+    id: NodeId,
+    latest_metadata: LogMetadata,
+) -> Option<Arc<Notify>> {
+    let leader_state_locked = leader_state.lock().unwrap();
+    let catchup_tracker = &leader_state_locked.as_ref().unwrap().catchup_tracker;
+    catchup_tracker.get(&(id, latest_metadata.index)).cloned()
+}
+
+fn check_state_and_handle_rpc_failure(
+    failed: Arc<AtomicU32>,
+    notify: Arc<Notify>,
+    state: Arc<Mutex<NodeState>>,
+) {
+    let state_lock = state.lock().unwrap();
+    if state_lock.current_type == NodeType::Leader {
+        return;
+    }
+    let num_nodes = state_lock.peers.len();
+    let failed = failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if is_majority(failed, num_nodes) {
+        notify.notify_one();
     }
 }
 
@@ -562,14 +635,22 @@ fn handle_successful_append(
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     accepted_count: Arc<AtomicU32>,
     metadata: LogMetadata,
-    i: usize,
     notify: Arc<Notify>,
 ) {
     let mut state_lock = state.lock().unwrap();
+    // TODO: why is this causing issue?
+    if state_lock.current_type != NodeType::Leader {
+        // debug!(
+        //     node = state_lock.id.0,
+        //     "not leader, should be ignoring successful append",
+        // );
+        return;
+    }
     let count = accepted_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
 
     if just_majority(count, state_lock.peers.len()) {
         // signal that majority is achieved
+        // TODO: might not need to mutate state every time
         if metadata.gt(&state_lock.commit_index) {
             state_lock.commit_index = metadata;
         }
@@ -578,10 +659,10 @@ fn handle_successful_append(
 
     drop(state_lock);
 
-    let mut binding = leader_state.lock().unwrap();
+    // let mut binding = leader_state.lock().unwrap();
     // 06/19/2026 09:32 PM IST - TODO: fix this bug of leader_state becoming None
 
     // let leader_state = binding.as_mut().unwrap();
     // leader_state.match_index[i] = metadata.index;
-    drop(binding)
+    // drop(binding)
 }

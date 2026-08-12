@@ -129,18 +129,25 @@ impl RaftRpc for Node {
         leader_commit: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
         let mut state = self.state.lock().unwrap();
-
-        // TODO: remove this later
-        if state.current_term == term && state.current_type == NodeType::Leader {
-            warn!(
-                sender = leader_id.0,
-                sender_term = term,
-                current_term = state.current_term,
-                receiver = state.id.0,
-                // current_type = state.current_type,
-                "something is wrong here. append_entries from invalid node",
-            );
-        }
+        debug!(
+            node = state.id.0,
+            logs = format!("{:?}", logs),
+            leader_id = leader_id.0,
+            leader_term = term,
+            current_term = state.current_term,
+            "append_entries call received"
+        );
+        // // TODO: remove this later
+        // if state.current_term == term && state.current_type == NodeType::Leader {
+        //     warn!(
+        //         sender = leader_id.0,
+        //         sender_term = term,
+        //         current_term = state.current_term,
+        //         receiver = state.id.0,
+        //         // current_type = state.current_type,
+        //         "something is wrong here. append_entries from invalid node",
+        //     );
+        // }
         if state.current_term > term {
             debug!(
                 node = state.id.0,
@@ -167,6 +174,7 @@ impl RaftRpc for Node {
                 "accepted leader"
             );
         }
+        // TODO: makes more sense to do these things when only needed
         state.voted_for = None;
         state.current_term = term;
         state.leader = Some(leader_id);

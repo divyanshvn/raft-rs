@@ -15,13 +15,6 @@ pub fn rand_election_timeout(min_timeout: u64) -> u64 {
     min_timeout + (rand::random::<u64>() % min_timeout)
 }
 
-pub fn exceeds_majority(num: u32, total: usize) -> bool {
-    if (num as usize) >= (total + 1).div_ceil(2) {
-        return true;
-    }
-    false
-}
-
 pub fn is_majority(num: u32, total: usize) -> bool {
     if (num as usize) >= (total + 1).div_ceil(2) {
         return true;

@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::Notify;
 
 use crate::raft_rpc::RaftRpcClient;
 use crate::utils::get_current_time;
 
 pub struct VoteRequest {}
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct NodeId(pub usize);
 
 pub const START: &str = "START";
@@ -64,7 +67,7 @@ pub struct NodeState {
 }
 
 impl NodeState {
-    // finds the matching entry to match_log in self.logs, returns the index in logs[] if found, else None.
+    /// finds the matching entry to match_log in self.logs, returns the index in logs[] if found, else None.
     pub fn find_matching_log_entry(&self, match_log: &LogMetadata) -> Option<usize> {
         for i in (0..self.logs.len()).rev() {
             let log_meta = self.logs.get(i).unwrap().metadata;
@@ -89,11 +92,12 @@ impl NodeState {
     }
 }
 
-#[derive(Clone)]
 pub struct LeaderState {
     // 05/25/2026 12:13 PM IST - WARNING: i am not actually using match_index because i am sending all the logs together (iteratively), but i probably should later.
     pub(crate) match_index: Vec<u32>, // index of the highest log known to be replicated on the follower
     pub(crate) next_log_index: u32,   // next index of the log in the leader's logs[] array
+    // TODO: LATER but curious if Notify needs to be wrapped in Arc
+    pub(crate) catchup_tracker: HashMap<(NodeId, u32), Arc<Notify>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

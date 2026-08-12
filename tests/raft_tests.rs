@@ -4,10 +4,10 @@ use std::thread::current;
 use std::time::{self, Duration};
 
 use common::config::Config;
-use tarpc::context;
+use tarpc::{context, trace};
 use time::Instant;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{debug, info};
 
 #[tokio::test]
 async fn test_initial_election() {
@@ -56,8 +56,12 @@ async fn test_re_election() {
             (Instant::now() - before_time).as_millis()
         );
         leaders.push(leader);
+        let mut context = context::Context::current();
+        context.deadline = Instant::now() + Duration::from_secs(15);
+        let log_str = format!("test-{}", i);
+        info!(log_str, leader, "calling reply_log");
         cfg.clients[&leader]
-            .reply_log(context::current(), "test".to_string())
+            .reply_log(context, log_str)
             .await
             .unwrap()
             .unwrap();
