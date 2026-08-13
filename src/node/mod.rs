@@ -1,7 +1,5 @@
-use core::range;
 use std::{
     collections::{HashMap, VecDeque},
-    ops::DerefMut,
     sync::{
         atomic::{AtomicU32, Ordering},
         Arc,
@@ -10,18 +8,15 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use rand::seq::IndexedRandom;
 use serde::{Deserialize, Serialize};
 use tarpc::context;
 use tokio::{
     sync::{Mutex, Notify},
-    task::JoinHandle,
-    time::{sleep, Sleep},
+    time::sleep,
 };
 use tracing::{debug, info, warn};
 
 use crate::{
-    client_rpc::ClientRpc,
     raft_rpc::{RaftRpc, RaftRpcClient},
     types1::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
     utils::{get_current_time, is_majority, just_majority, rand_election_timeout, MIN_TIMEOUT},

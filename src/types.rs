@@ -52,18 +52,15 @@ pub struct NodeState {
     pub(crate) current_type: NodeType,
     pub(crate) logs: Vec<Log>,
     pub(crate) current_term: u32,
-    pub(crate) voted_for: Option<(NodeId, u32)>, // node id of the node that was voted for when a requestToVote for (current_term + 1) was received
-    pub(crate) commit_index: LogMetadata,        // maybe this should be option
-    // 05/23/2026 12:18 PM IST - THINK: should commit_index be some other datatype?
-    pub(crate) latest_log: LogMetadata, // maybe this should be option
-
-    pub(crate) leader: Option<NodeId>, // maybe this should be option? , i am scared of the start.
-    // Or maybe , on start/initialization, i will have a log: "start" which will also be marked as committed. with logIndex and term as 0, 0.
+    pub(crate) voted_for: Option<(NodeId, u32)>,
+    pub(crate) commit_index: LogMetadata,
+    pub(crate) latest_log: LogMetadata,
+    pub(crate) leader: Option<NodeId>,
     pub(crate) id: NodeId,
-    pub(crate) timeout: u64, // maybe a duration , instead of just seconds. random interval will be added on top of it during election timeout computation.
+    pub(crate) timeout: u64,
     pub(crate) peers: Vec<RaftRpcClient>,
     pub(crate) last_applied: usize, // index into log_entries. MAKE SURE TO CHANGE WHEN DUMPING LOGS
-    pub(crate) last_leader_contact: u64, // epoch of the last leader interaction
+    pub(crate) last_leader_contact: u64,
 }
 
 impl NodeState {
@@ -96,7 +93,6 @@ pub struct LeaderState {
     // 05/25/2026 12:13 PM IST - WARNING: i am not actually using match_index because i am sending all the logs together (iteratively), but i probably should later.
     pub(crate) match_index: Vec<u32>, // index of the highest log known to be replicated on the follower
     pub(crate) next_log_index: u32,   // next index of the log in the leader's logs[] array
-    // TODO: LATER but curious if Notify needs to be wrapped in Arc
     pub(crate) catchup_tracker: HashMap<(NodeId, u32), Arc<Notify>>,
 }
 

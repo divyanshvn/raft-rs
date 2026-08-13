@@ -46,7 +46,6 @@ impl RaftRpc for Node {
             return Ok((state.current_term, false));
         }
 
-        // 05/23/2026 02:37 PM IST - TODO: need to add LeaderStickiness part here. Not yet added.
         // Leader stickiness, wherein requestToVote is rejected if the follower thinks that a leader still exists.
         if state.last_leader_contact + MIN_TIMEOUT >= get_current_time() {
             debug!(
@@ -68,16 +67,13 @@ impl RaftRpc for Node {
             );
             state.current_type = NodeType::Follower;
             state.current_term = term;
-            // 05/25/2026 11:29 PM IST - TODO: should leader start its own election timer after this?
 
-            // TODO: fix this bug, where leader_state will be None , but then it reflects
-
-            // let mut leader_state = self.leader_state.lock().await;
-            // *leader_state = None;
+            let mut leader_state = self.leader_state.lock().await;
+            *leader_state = None;
         }
 
         if let Some(vote) = state.voted_for {
-            // 05/23/2026 02:34 PM IST - NOTE: what if the term that it had voted for had been a previous one ? and that election didn't reach a majority vote. That is covered here.
+            // 05/23/2026 02:34 PM IST - NOTE: Scenario covered: what if the term that it had voted for had been a previous one, and that election didn't reach a majority vote.
             let vote_term = vote.1;
 
             // candidate's term not greater than the voted term, hence we have already voted.
@@ -116,7 +112,7 @@ impl RaftRpc for Node {
             "vote granted"
         );
 
-        return Ok((state.current_term, true));
+        Ok((state.current_term, true))
     }
 
     async fn append_entries(
@@ -137,17 +133,6 @@ impl RaftRpc for Node {
             current_term = state.current_term,
             "append_entries call received"
         );
-        // // TODO: remove this later
-        // if state.current_term == term && state.current_type == NodeType::Leader {
-        //     warn!(
-        //         sender = leader_id.0,
-        //         sender_term = term,
-        //         current_term = state.current_term,
-        //         receiver = state.id.0,
-        //         // current_type = state.current_type,
-        //         "something is wrong here. append_entries from invalid node",
-        //     );
-        // }
         if state.current_term > term {
             debug!(
                 node = state.id.0,
@@ -157,10 +142,6 @@ impl RaftRpc for Node {
                 "rejecting append_entries for stale term"
             );
             return Ok((state.current_term, false));
-        }
-        // 05/25/2026 02:04 PM IST - TODO: reset election timer
-        if state.current_type == NodeType::Leader {
-            debug!(node = state.id.0, "Outdated leader");
         }
 
         // Handles both outdated-term followers and competing candidates who lost.
@@ -211,6 +192,7 @@ impl RaftRpc for Node {
         // append new entries
         let appended = logs.len();
         state.logs.append(&mut logs.clone());
+
         // NOTE: assuming that the logs[] arrray isn't ever empty
         state.latest_log = state.logs.last().unwrap().metadata;
         debug!(
@@ -224,8 +206,6 @@ impl RaftRpc for Node {
             "append_entries accepted"
         );
 
-        // 05/23/2026 04:11 PM IST - TODO: RESET TIMER OF ELECTION
-
         // update commit_index and apply the unapplied committed entries.
         // NOTE: i know that when appendEntries is used for catching up , if leader passes its original commit_index , then it migth not be yet present in the follower node. And therefore it might be better to update it to the latest log entry in logs[] ... but even if it's set to leader_commit , then too it will keep applying the entries till it reaches end of logs[] which has the same effect.
         state.commit_index = leader_commit;
@@ -238,6 +218,6 @@ impl RaftRpc for Node {
             }
         }
 
-        return Ok((state.current_term, true));
+        Ok((state.current_term, true))
     }
 }
