@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     raft_rpc::{RaftRpc, RaftRpcClient},
-    types1::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
+    types::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
     utils::{get_current_time, is_majority, just_majority, rand_election_timeout, MIN_TIMEOUT},
 };
 

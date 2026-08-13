@@ -3,7 +3,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     node::Node,
-    types1::{Log, LogMetadata, NodeId, NodeType},
+    types::{Log, LogMetadata, NodeId, NodeType},
     utils::{get_current_time, MIN_TIMEOUT},
 };
 

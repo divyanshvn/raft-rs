@@ -1,15 +1,6 @@
-use std::{
-    any::Any,
-    collections::VecDeque,
-    sync::{atomic::AtomicU32, Arc, Mutex},
-};
-
 use anyhow::Result;
 
-use crate::{
-    node::Node,
-    types1::{LeaderState, Log, LogMetadata, NodeState, NodeType},
-};
+use crate::node::Node;
 
 #[tarpc::service]
 pub trait ClientRpc {
