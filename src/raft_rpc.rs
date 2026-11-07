@@ -35,6 +35,7 @@ impl RaftRpc for Node {
         latest_log_metadata: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
         let mut state = self.state.lock().await;
+        state.healthy()?;
         if term <= state.current_term {
             debug!(
                 node = state.id.0,
@@ -67,6 +68,7 @@ impl RaftRpc for Node {
             );
             state.current_type = NodeType::Follower;
             state.current_term = term;
+            state.persist()?;
 
             let mut leader_state = self.leader_state.lock().await;
             *leader_state = None;
@@ -105,6 +107,7 @@ impl RaftRpc for Node {
         }
 
         state.voted_for = Some((candidate_id, term));
+        state.persist()?;
         info!(
             node = state.id.0,
             candidate_id = candidate_id.0,
@@ -125,6 +128,7 @@ impl RaftRpc for Node {
         leader_commit: LogMetadata,
     ) -> anyhow::Result<(u32, bool)> {
         let mut state = self.state.lock().await;
+        state.healthy()?;
         debug!(
             node = state.id.0,
             logs = format!("{:?}", logs),
@@ -158,6 +162,7 @@ impl RaftRpc for Node {
         // TODO: makes more sense to do these things when only needed
         state.voted_for = None;
         state.current_term = term;
+        state.persist()?;
         state.leader = Some(leader_id);
         state.current_type = NodeType::Follower;
 
@@ -195,6 +200,7 @@ impl RaftRpc for Node {
 
         // NOTE: assuming that the logs[] arrray isn't ever empty
         state.latest_log = state.logs.last().unwrap().metadata;
+        state.persist()?;
         debug!(
             node = state.id.0,
             leader_id = leader_id.0,

@@ -5,6 +5,7 @@ use std::{
         Arc,
     },
     time::{Duration, Instant},
+    u64,
 };
 
 use anyhow::{anyhow, Result};
@@ -19,13 +20,25 @@ use tracing::{debug, info, warn};
 use crate::{
     raft_rpc::{RaftRpc, RaftRpcClient},
     types::{LeaderState, Log, LogMetadata, NodeId, NodeState, NodeType, START},
-    utils::{get_current_time, is_majority, just_majority, rand_election_timeout, MIN_TIMEOUT},
+    utils::{
+        context_with_deadline, get_current_time, is_majority, just_majority, rand_election_timeout,
+        MIN_TIMEOUT,
+    },
 };
 
 #[derive(Clone)]
 pub struct Node {
     pub(crate) state: Arc<Mutex<NodeState>>,
     pub(crate) leader_state: Arc<Mutex<Option<LeaderState>>>, // might not need if i use this state within leader's function, but what if leader goes down for just a bit, need to store this in that case, in case leader remains the leader.
+}
+
+struct AppendEntriesDetails {
+    leader_id: NodeId,
+    current_term: u32,
+    logs: Vec<Log>,
+    commit_index: LogMetadata,
+    peer: RaftRpcClient,
+    follower_id: usize,
 }
 
 impl Node {
@@ -50,12 +63,41 @@ impl Node {
             peers: peers.to_vec(),
             last_applied: 0,
             last_leader_contact: get_current_time(),
+            state_path: None,
+            failed: false,
         };
 
         Self {
             state: Arc::new(Mutex::new(node_state)),
             leader_state: Arc::new(Mutex::new(leader_state)),
         }
+    }
+
+    /// Open a local JSON state file. Callers must supply the same node identity.
+    pub fn open(
+        id: usize,
+        peers: &[RaftRpcClient],
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self> {
+        anyhow::ensure!(id < peers.len(), "node ID must be a peer vector position");
+        let node = Self::new(id, peers);
+        {
+            let mut state = node.state.try_lock().unwrap();
+            state.state_path = Some(path.as_ref().to_path_buf());
+            match std::fs::read(path.as_ref()) {
+                Ok(bytes) => {
+                    let saved: crate::persistence::SavedState = serde_json::from_slice(&bytes)?;
+                    saved.validate(id, peers.len())?;
+                    state.current_term = saved.current_term;
+                    state.voted_for = saved.voted_for;
+                    state.logs = saved.logs;
+                    state.latest_log = state.logs.last().unwrap().metadata;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => state.persist()?,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(node)
     }
 
     pub async fn get_state(&self) -> (u32, bool) {
@@ -71,132 +113,43 @@ impl Node {
 
     pub async fn start(mut self, node_type: Option<NodeType>) -> Result<()> {
         {
-            let mut state = self.state.lock().await;
-
-            state.current_type = node_type.unwrap_or(NodeType::Follower);
-            if state.current_type == NodeType::Leader {
-                let mut mu = self.leader_state.lock().await;
-                state.current_term = 1;
-                *mu = Some(LeaderState {
-                    match_index: vec![0; state.peers.len()],
-                    next_log_index: 1,
-                    catchup_tracker: HashMap::new(),
-                });
-            }
+            let state = self.state.lock().await;
+            state.healthy()?;
+            anyhow::ensure!(
+                state.state_path.is_none()
+                    || node_type.is_none()
+                    || node_type == Some(NodeType::Follower),
+                "persistent nodes must start as followers"
+            );
         }
+        self.initialize_states(node_type).await;
 
         loop {
             let (node_type, id) = {
                 let state = self.state.lock().await;
-                (state.current_type.clone(), state.id)
+                {
+                    state.healthy()?;
+                    (state.current_type.clone(), state.id)
+                }
             };
             match node_type {
                 NodeType::Leader => {
-                    {
-                        let mut state = self.state.lock().await;
-                        state.last_leader_contact = get_current_time();
-                        debug!(
-                            node = state.id.0,
-                            term = state.current_term,
-                            latest_log_index = state.latest_log.index,
-                            "node is leader"
-                        );
-                        *(self.leader_state.lock().await) = Some(LeaderState {
-                            match_index: vec![0; state.peers.len()],
-                            next_log_index: state.latest_log.index + 1,
-                            catchup_tracker: HashMap::new(),
-                        });
-                    }
-                    // initialize (or even re-initialize in some state vars case) the state variables accordingly
+                    self.initialize_leader().await;
                     // TODO: I Shouldn't be not unwrapping here.
+                    // More Importantly, What should i be doing when call_append_entries returns Err?
                     self.call_append_entries(vec![]).await;
-                    // call appendEntries for all. (maybe if possible call its own reply_log)
 
                     // NOTE: made this half of MIN_TIMEOUT to be on the safer side.
-                    let mut timeout = MIN_TIMEOUT / 2;
-
                     // need to spin up a task, that awaits for the tasks in task_queue
-                    loop {
-                        let task = tokio::spawn(async move {
-                            sleep(Duration::from_millis(timeout)).await;
-                        });
-                        task.await.unwrap();
-                        debug!(node = id.0, "leader timer up");
+                    self.loop_leader(MIN_TIMEOUT / 2, &id).await;
 
-                        let (last_leader_contact, current_type) = {
-                            let state = self.state.lock().await;
-                            (state.last_leader_contact, state.current_type.clone())
-                        };
-                        if current_type != NodeType::Leader {
-                            debug!(
-                                node = id.0,
-                                state = format!("{:?}", current_type),
-                                "no longer the leader"
-                            );
-                            break;
-                        }
-                        let current_time = get_current_time();
-                        let time_since_leader_contact = current_time - last_leader_contact;
-
-                        timeout = if time_since_leader_contact >= timeout {
-                            info!(
-                                node = id.0,
-                                state = format!("{:?}", current_type),
-                                "calling empty append_entries"
-                            );
-                            debug!(node = id.0, "calling append_entries");
-                            // TODO: I Shouldn't be not unwrapping here.
-                            self.call_append_entries(vec![]).await;
-                            debug!(node = id.0, "append_entries done");
-                            timeout
-                        } else {
-                            timeout - time_since_leader_contact
-                        };
-                    }
                     debug!(node = id.0, "got out of leader loop");
                 }
                 NodeType::Follower => {
                     // election timeout monitor (maybe a loop based approach)
-                    let mut timeout = rand_election_timeout(MIN_TIMEOUT);
+                    let timeout = rand_election_timeout(MIN_TIMEOUT);
                     debug!(node = id.0, timeout, "becoming follower now");
-                    loop {
-                        debug!(timeout, node = id.0, "going to sleep");
-                        let current_time = Instant::now();
-                        let task = tokio::spawn(async move {
-                            sleep(Duration::from_millis(timeout)).await;
-                        });
-                        task.await.unwrap();
-                        debug!(
-                            timeout,
-                            node = id.0,
-                            "got out of sleep after {} ms",
-                            current_time.elapsed().as_millis()
-                        );
-
-                        let mut state = self.state.lock().await;
-                        let current_time = get_current_time();
-                        let time_since_leader_contact = current_time - state.last_leader_contact;
-                        let new_election_timeout = rand_election_timeout(MIN_TIMEOUT) as i64
-                            - time_since_leader_contact as i64;
-
-                        // if time since the last leader contact > the timeout, then it needs to become a candidate.
-                        if time_since_leader_contact > timeout || new_election_timeout <= 0 {
-                            state.current_type = NodeType::Candidate;
-                            state.current_term += 1;
-                            state.voted_for = Some((state.id, state.current_term));
-                            info!(
-                                node_id = state.id.0,
-                                term = state.current_term,
-                                timeout_ms = timeout,
-                                "election timeout elapsed"
-                            );
-                            break;
-                        }
-
-                        // While, if the leader has contacted in between, then timeout restarts. But it should be such that the timer restarted when the new leader contacted it, not when the old timer finishes. Therefore, it will make more sense to deduct the time since last leader contact. Is that guaranteed to be > 0, might not be since this a distribution from timeout to 2*timeout, therefore if it is greater than such, in that case one should become a candidate.
-                        timeout = new_election_timeout as u64;
-                        state.timeout = timeout;
-                    }
+                    self.loop_follower(timeout, id.0).await;
                 }
                 NodeType::Candidate => {
                     // 05/24/2026 08:34 AM IST - TODO: how should i check the timer here
@@ -302,6 +255,7 @@ impl Node {
                         // Election to be conducted again
                         state_locked.current_term += 1;
                         state_locked.voted_for = Some((state_locked.id, state_locked.current_term));
+                        state_locked.persist()?;
                         continue;
                     }
                 }
@@ -312,6 +266,7 @@ impl Node {
     pub async fn call_append_entries(&mut self, logs_str: Vec<String>) -> Result<()> {
         let (peers, leader_id, logs, commit_index, current_term, prev_log) = {
             let mut state = self.state.lock().await;
+            state.healthy()?;
 
             if state.current_type != NodeType::Leader {
                 return Err(anyhow!("Current_node : {:?}, current_state: {:?}, call_append_entries called by non-leader", state.id, state.current_type));
@@ -339,15 +294,8 @@ impl Node {
             state.logs.append(&mut logs.clone());
 
             state.latest_log = log_metadata;
+            state.persist()?;
             state.last_leader_contact = get_current_time();
-            debug!(
-                node_id = state.id.0,
-                term = state.current_term,
-                entries = logs.len(),
-                prev_log_index = prev_log.index,
-                prev_log_term = prev_log.term,
-                "sending append_entries"
-            );
             (
                 state.peers.clone(),
                 state.id,
@@ -382,14 +330,16 @@ impl Node {
             let task = tokio::spawn(async move {
                 debug!("spawning append_entries task node={}", i);
                 append_entry_task(
-                    logs_cl,
-                    peer_c,
+                    AppendEntriesDetails {
+                        leader_id,
+                        current_term,
+                        logs: logs_cl,
+                        commit_index,
+                        peer: peer_c,
+                        follower_id: i,
+                    },
                     count_cl,
-                    leader_id,
-                    commit_index,
-                    current_term,
                     prev_log,
-                    i,
                     state_c,
                     leader_state_c,
                     notify_cl,
@@ -403,11 +353,126 @@ impl Node {
 
         notify.notified().await;
 
+        self.state.lock().await.healthy()?;
         if is_majority(count.accepted.load(Ordering::SeqCst), peers.len()) {
             Ok(())
         } else {
-            debug!("Majority of append_entries failed");
             Err(anyhow!("Majority of append_entries failed"))
+        }
+    }
+
+    async fn initialize_states(&self, node_type: Option<NodeType>) {
+        let mut state = self.state.lock().await;
+
+        state.current_type = node_type.unwrap_or(NodeType::Follower);
+        if state.current_type == NodeType::Leader {
+            let mut mu = self.leader_state.lock().await;
+            state.current_term = 1;
+            *mu = Some(LeaderState {
+                match_index: vec![0; state.peers.len()],
+                next_log_index: 1,
+                catchup_tracker: HashMap::new(),
+            });
+        }
+    }
+
+    async fn initialize_leader(&self) {
+        let mut state = self.state.lock().await;
+        state.last_leader_contact = get_current_time();
+        debug!(
+            node = state.id.0,
+            term = state.current_term,
+            latest_log_index = state.latest_log.index,
+            "node is leader"
+        );
+        *(self.leader_state.lock().await) = Some(LeaderState {
+            match_index: vec![0; state.peers.len()],
+            next_log_index: state.latest_log.index + 1,
+            catchup_tracker: HashMap::new(),
+        });
+    }
+
+    async fn loop_leader(&mut self, mut timeout: u64, leader_id: &NodeId) {
+        loop {
+            let task = tokio::spawn(async move {
+                sleep(Duration::from_millis(timeout)).await;
+            });
+            task.await.unwrap();
+            debug!(node = leader_id.0, "leader timer up");
+
+            let (last_leader_contact, current_type) = {
+                let state = self.state.lock().await;
+                (state.last_leader_contact, state.current_type.clone())
+            };
+            if current_type != NodeType::Leader {
+                debug!(
+                    node = leader_id.0,
+                    state = format!("{:?}", current_type),
+                    "no longer the leader"
+                );
+                break;
+            }
+            let current_time = get_current_time();
+            let time_since_leader_contact = current_time - last_leader_contact;
+
+            timeout = if time_since_leader_contact >= timeout {
+                info!(
+                    node = leader_id.0,
+                    state = format!("{:?}", current_type),
+                    "calling empty append_entries"
+                );
+                debug!(node = leader_id.0, "calling append_entries");
+                // TODO: I Shouldn't be not unwrapping here.
+                self.call_append_entries(vec![]).await;
+                debug!(node = leader_id.0, "append_entries done");
+                timeout
+            } else {
+                timeout - time_since_leader_contact
+            };
+        }
+    }
+
+    async fn loop_follower(&mut self, mut timeout: u64, follower_id: usize) {
+        loop {
+            debug!(timeout, node = follower_id, "going to sleep");
+            let current_time = Instant::now();
+            let task = tokio::spawn(async move {
+                sleep(Duration::from_millis(timeout)).await;
+            });
+            task.await.unwrap();
+            debug!(
+                timeout,
+                node = follower_id,
+                "got out of sleep after {} ms",
+                current_time.elapsed().as_millis()
+            );
+
+            let mut state = self.state.lock().await;
+            let current_time = get_current_time();
+            let time_since_leader_contact = current_time - state.last_leader_contact;
+            let new_election_timeout =
+                rand_election_timeout(MIN_TIMEOUT) as i64 - time_since_leader_contact as i64;
+
+            // if time since the last leader contact > the timeout, then it needs to become a candidate.
+            if time_since_leader_contact > timeout || new_election_timeout <= 0 {
+                state.current_type = NodeType::Candidate;
+                state.current_term += 1;
+                state.voted_for = Some((state.id, state.current_term));
+                if state.persist().is_err() {
+                    return;
+                }
+                info!(
+                    node_id = state.id.0,
+                    term = state.current_term,
+                    timeout_ms = timeout,
+                    "election timeout elapsed"
+                );
+                break;
+            }
+
+            // While, if the leader has contacted in between, then timeout restarts. But it should be such that the timer restarted when the new leader contacted it, not when the old timer finishes. Therefore, it will make more sense to deduct the time since last leader contact. Is that guaranteed to be > 0, might not be since this a distribution from timeout to 2*timeout, therefore if it is greater than such, in that case one should become a candidate.
+            timeout = new_election_timeout as u64;
+            state.timeout = timeout;
         }
     }
 }
@@ -419,20 +484,21 @@ struct ConsensusCount {
 }
 
 // called by the leader, handles sending appendEntries RPC to follower
+// AI_AGENT: suggest some ergonomic minimal way to reduce the number of arguments
 async fn append_entry_task(
-    logs: Vec<Log>,
-    peer: RaftRpcClient,
+    append_details: AppendEntriesDetails,
     count: ConsensusCount,
-    leader_id: NodeId,
-    commit_index: LogMetadata,
-    current_term: u32,
     prev_log: LogMetadata,
-    id: usize,
     state: Arc<Mutex<NodeState>>,
     leader_state: Arc<Mutex<Option<LeaderState>>>,
     notify: Arc<Notify>,
 ) {
-    // WARNING: there are too many arguments in this function call. I did this initially just so that i don't have to lock and read state again. I need to rethink this strategy later.
+    let leader_id = append_details.leader_id;
+    let current_term = append_details.current_term;
+    let logs = append_details.logs;
+    let peer = append_details.peer;
+    let commit_index = append_details.commit_index;
+    let follower_id = append_details.follower_id;
     let latest_metadata = if logs.is_empty() {
         prev_log
     } else {
@@ -440,17 +506,13 @@ async fn append_entry_task(
     };
 
     debug!(
-        node = id,
+        node = follower_id,
         logs = format!("{:?}", logs),
         "sending append_entries"
     );
-    let mut context = context::Context::current();
-    let deadline_duration = Duration::from_millis(MIN_TIMEOUT);
-    context.deadline = Instant::now() + deadline_duration;
-
     let response = peer
         .append_entries(
-            context,
+            context_with_deadline(Duration::from_millis(MIN_TIMEOUT)),
             current_term,
             leader_id,
             prev_log,
@@ -460,7 +522,7 @@ async fn append_entry_task(
         .await;
 
     debug!(
-        node = id,
+        node = follower_id,
         logs = format!("{:?}", logs),
         "append_entries sent"
     );
@@ -470,7 +532,7 @@ async fn append_entry_task(
         Err(err) => {
             handle_rpc_failure(count.failed, notify, state).await;
             debug!(
-                node = id,
+                node = follower_id,
                 logs = format!("{:?}", logs),
                 term = current_term,
                 leader = leader_id.0,
@@ -482,7 +544,7 @@ async fn append_entry_task(
         Ok(Err(err)) => {
             handle_rpc_failure(count.failed, notify, state).await;
             debug!(
-                node = id,
+                node = follower_id,
                 logs = format!("{:?}", logs),
                 term = current_term,
                 leader = leader_id.0,
@@ -505,37 +567,33 @@ async fn append_entry_task(
     if response.0 > current_term {
         warn!(
             leader_id = leader_id.0,
-            id,
+            id = follower_id,
             current_term,
             peer_term = response.0,
             "leader observed higher term"
         );
-        let mut state_locked = state.lock().await;
-        state_locked.current_type = NodeType::Follower;
-        state_locked.current_term = response.0;
-        let failed = count
-            .failed
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        if is_majority(failed, state_locked.peers.len()) {
-            notify.notify_one();
-        }
-        let mut leader_state_locked = leader_state.lock().await;
-        // TODO: what happens to the heap allocation when i make it None?
-        *leader_state_locked = None;
+        handle_leader_removal(
+            state.clone(),
+            leader_state.clone(),
+            count,
+            notify,
+            response.0,
+        )
+        .await;
         return;
     }
 
     if !node_is_leader(&state).await {
         handle_rpc_failure(count.failed, notify, state).await;
         debug!(
-            node = id,
+            node = follower_id,
             logs = format!("{:?}", logs),
             "node is not leader, aborting append_entries"
         );
         return;
     }
 
+    // checking if the catchup is already undergoing
     if let Some(catchup_notify) = check_catchup(&leader_state, leader_id, latest_metadata).await {
         catchup_notify.notified().await;
         handle_successful_append(state, leader_state, count.accepted, latest_metadata, notify)
@@ -544,9 +602,41 @@ async fn append_entry_task(
     };
 
     // handle failed append_entries, i.e. the follower needs to catch up
-    let mut entries = VecDeque::from(logs);
+    handle_follower_catchup(
+        state,
+        leader_state,
+        AppendEntriesDetails {
+            leader_id,
+            current_term,
+            logs,
+            commit_index,
+            peer,
+            follower_id,
+        },
+        count,
+        notify,
+        latest_metadata,
+    )
+    .await;
+}
+
+async fn handle_follower_catchup(
+    state: Arc<Mutex<NodeState>>,
+    leader_state: Arc<Mutex<Option<LeaderState>>>,
+    append_details: AppendEntriesDetails,
+    count: ConsensusCount,
+    notify: Arc<Notify>,
+    latest_metadata: LogMetadata,
+) {
+    let mut entries = VecDeque::from(append_details.logs);
     let catch_notify = Arc::new(Notify::new());
-    insert_catchup_tracker(&leader_state, id, latest_metadata, catch_notify.clone()).await;
+    insert_catchup_tracker(
+        &leader_state,
+        append_details.follower_id,
+        latest_metadata,
+        catch_notify.clone(),
+    )
+    .await;
 
     let logs = { state.lock().await.logs.clone() };
     // iteration starts from 1 because at initialization all logs contain the "START" log.
@@ -555,14 +645,15 @@ async fn append_entry_task(
         let prev_log = logs[j - 1].metadata;
         entries.push_front(logs[j].clone());
 
-        let response = peer
+        let response = append_details
+            .peer
             .append_entries(
                 context::current(),
-                current_term,
-                leader_id,
+                append_details.current_term,
+                append_details.leader_id,
                 prev_log,
                 entries.clone().into(),
-                commit_index,
+                append_details.commit_index,
             )
             .await;
 
@@ -580,6 +671,32 @@ async fn append_entry_task(
             return;
         }
     }
+}
+
+async fn handle_leader_removal(
+    state: Arc<Mutex<NodeState>>,
+    leader_state: Arc<Mutex<Option<LeaderState>>>,
+    count: ConsensusCount,
+    notify: Arc<Notify>,
+    current_term: u32,
+) {
+    let mut state_locked = state.lock().await;
+    state_locked.current_type = NodeType::Follower;
+    state_locked.current_term = current_term;
+    if state_locked.persist().is_err() {
+        notify.notify_one();
+        return;
+    }
+    let failed = count
+        .failed
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    if is_majority(failed, state_locked.peers.len()) {
+        notify.notify_one();
+    }
+    let mut leader_state_locked = leader_state.lock().await;
+    // TODO: what happens to the heap allocation when i make it None?
+    *leader_state_locked = None;
 }
 
 async fn node_is_leader(state: &Mutex<NodeState>) -> bool {

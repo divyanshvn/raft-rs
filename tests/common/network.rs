@@ -6,7 +6,7 @@ use tokio::time::{sleep, Duration};
 use anyhow::Result;
 
 use raft_rs::raft_rpc::{RaftRpc, RaftRpcClient};
-use raft_rs::types1::{Log, LogMetadata, NodeId};
+use raft_rs::types::{Log, LogMetadata, NodeId};
 
 pub struct Network {
     pub reliable: AtomicBool,

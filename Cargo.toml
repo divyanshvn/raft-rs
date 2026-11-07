@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0.100"
 async-recursion = "1.1.1"
+console-subscriber = "0.5.0"
 futures = "0.3.32"
 rand = "0.10.1"
 serde = {version = "1.0.228", features = ["derive"]}
@@ -18,3 +19,6 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+
+[build]
+rustflags = ["--cfg", "tokio_unstable"]

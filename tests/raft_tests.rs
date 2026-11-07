@@ -1,6 +1,5 @@
 mod common;
 
-use std::thread::current;
 use std::time::{self, Duration};
 
 use common::config::Config;

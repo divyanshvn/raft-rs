@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use raft_rs::client_rpc::{ClientRpc, ClientRpcClient};
-use raft_rs::types1::NodeType;
+use raft_rs::types::NodeType;
 use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;

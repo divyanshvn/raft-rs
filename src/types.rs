@@ -61,6 +61,8 @@ pub struct NodeState {
     pub(crate) peers: Vec<RaftRpcClient>,
     pub(crate) last_applied: usize, // index into log_entries. MAKE SURE TO CHANGE WHEN DUMPING LOGS
     pub(crate) last_leader_contact: u64,
+    pub(crate) state_path: Option<std::path::PathBuf>,
+    pub(crate) failed: bool,
 }
 
 impl NodeState {

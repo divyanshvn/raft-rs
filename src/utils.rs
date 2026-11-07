@@ -1,4 +1,6 @@
-use std::time::{self, UNIX_EPOCH};
+use std::time::{self, Duration, Instant, UNIX_EPOCH};
+
+use tarpc::context::Context;
 
 pub const MIN_TIMEOUT: u64 = 500; // 100 mili-seconds
 
@@ -25,4 +27,10 @@ pub fn just_majority(num: u32, total: usize) -> bool {
         return true;
     }
     false
+}
+
+pub fn context_with_deadline(deadline_duration: Duration) -> Context {
+    let mut context = Context::current();
+    context.deadline = Instant::now() + deadline_duration;
+    context
 }
